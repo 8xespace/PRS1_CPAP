@@ -1,0 +1,72 @@
+###############################################################################
+# Flutter / Dart
+###############################################################################
+
+.dart_tool/
+.packages
+.pub/
+.pub-cache/
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+coverage/
+
+###############################################################################
+# Android
+###############################################################################
+
+android/.gradle/
+android/local.properties
+android/key.properties
+android/**/GeneratedPluginRegistrant.java
+
+android/app/debug/
+android/app/profile/
+android/app/release/
+
+###############################################################################
+# iOS
+###############################################################################
+
+ios/Pods/
+ios/.symlinks/
+ios/Flutter/Flutter.framework
+ios/Flutter/Flutter.podspec
+ios/Flutter/Generated.xcconfig
+ios/Flutter/app.flx
+ios/Flutter/ephemeral/
+ios/Runner/GeneratedPluginRegistrant.*
+
+###############################################################################
+# macOS
+###############################################################################
+
+macos/Pods/
+macos/Flutter/ephemeral/
+
+###############################################################################
+# IDE / Editor
+###############################################################################
+
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+###############################################################################
+# System / Misc
+###############################################################################
+
+.DS_Store
+*.log
+*.swp
+*.class
+*.pyc
+.history
+.svn/
+.swiftpm/
+.build/
+.buildlog/
+.atom/
+migrate_working_dir/
