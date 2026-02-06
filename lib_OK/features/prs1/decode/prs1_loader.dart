@@ -1,0 +1,623 @@
+// lib/features/prs1/decode/prs1_loader.dart
+
+import 'dart:typed_data';
+
+import '../../../core/logging.dart';
+import '../binary/le_reader.dart';
+import '../model/prs1_device.dart';
+import '../model/prs1_event.dart';
+import '../model/prs1_session.dart';
+import '../model/prs1_signal_sample.dart';
+import 'edf_decoder.dart';
+import 'frame_decoder.dart';
+import 'event_decoder.dart';
+import 'session_stats.dart';
+
+/// Core decoder scaffold that will be progressively filled to match OSCAR's prs1_loader.cpp.
+///
+/// Current stage:
+/// - Detects basic file kind (EDF vs unknown)
+/// - For EDF, extracts session start time & duration (no waveform decoding yet)
+/// - Keeps stable types so we can later plug in the real PRS1 binary frame/event pipeline
+class Prs1Loader {
+  const Prs1Loader();
+
+  /// Parse a single PRS1-related file blob.
+  ///
+  /// [sourcePath] is optional but strongly recommended (used for labels/debug).
+  Prs1ParseResult parse(Uint8List bytes, {String? sourcePath}) {
+    final r = LeReader(bytes);
+
+    final head = Prs1DebugHeader(
+      length: bytes.length,
+      b0: bytes.isNotEmpty ? bytes[0] : null,
+      first16: bytes.length >= 16 ? Uint8List.sublistView(bytes, 0, 16) : Uint8List.fromList(bytes),
+    );
+
+    // Heuristic: attempt to read ASCII magic if present.
+    String? magic;
+    if (bytes.length >= 4) {
+      final m = r.str(4, trimNull: false);
+      final printable = m.codeUnits.every((c) => c >= 0x20 && c <= 0x7E);
+      if (printable) magic = m;
+      r.seek(0);
+    }
+
+    final detected = Prs1FileKind.detect(bytes, sourcePath: sourcePath);
+    Log.d('PRS1 parse: kind=$detected magic=${magic ?? "(none)"} len=${bytes.length} src=${sourcePath ?? "(mem)"}', tag: 'PRS1');
+
+    // Third layer: EDF header -> session.
+    if (detected == Prs1FileKind.edf) {
+      final s = EdfDecoder.tryParseSession(bytes, sourcePath: sourcePath);
+      return Prs1ParseResult(
+        kind: detected,
+        magic: magic,
+        header: head,
+        device: null,
+        sessions: s != null ? [s] : const [],
+      );
+    }
+
+    // PRS1 "chunk" files (.001/.002/.005, etc.)
+    //
+    // OSCAR parses Philips System One data as a sequence of data "chunks".
+    // Each chunk begins with a 15-byte common header:
+    //   [0]=fileVersion, [1..2]=blockSize (u16le), [3]=htype (0 normal,1 interval/wave),
+    //   [4]=family, [5]=familyVersion, [6]=ext, [7..10]=sessionId (u32le), [11..14]=timestamp (u32le unix).
+    //
+    // For our UI (Layer 3/6), the most important metric is *usage duration*.
+    // We can compute that reliably from interval chunks (htype==1) by reading
+    // interval_count and interval_seconds (see OSCAR's ReadWaveformHeader).
+    if (detected == Prs1FileKind.chunk) {
+      final sessions = _parseChunkFile(bytes, sourcePath: sourcePath);
+      return Prs1ParseResult(
+        kind: detected,
+        magic: magic,
+        header: head,
+        device: null,
+        sessions: sessions,
+      );
+    }
+
+    // Layer 4-5: PRS1 binary frame/event pipeline.
+///
+/// Layer 4 gave us deterministic slicing + placeholder semantics.
+/// Layer 5 adds:
+/// - CRC16 footer detection (in FrameDecoder)
+/// - Best-effort absolute timestamp extraction (in EventDecoder)
+///
+/// This is still not full OSCAR parity yet, but it produces *realistic* event times
+/// when the underlying records carry unix timestamps.
+    if (detected == Prs1FileKind.binary000 || detected == Prs1FileKind.binary001 || detected == Prs1FileKind.binary002) {
+      final frames = const FrameDecoder().decode(bytes).toList(growable: false);
+
+      // Fallback anchor when we only have minute-offset style records.
+      final fallbackStart = DateTime(2000, 1, 1, 0, 0, 0);
+
+      final events = EventDecoder().decodeFrames(
+        frames,
+        sessionStart: fallbackStart,
+      );
+
+      DateTime sessionStart = fallbackStart;
+      DateTime sessionEnd = fallbackStart;
+
+      if (events.isNotEmpty) {
+        events.sort((a, b) => a.time.compareTo(b.time));
+        sessionStart = events.first.time;
+        sessionEnd = events.last.time.add(const Duration(minutes: 1));
+      }
+
+      final minutesUsed = sessionEnd.difference(sessionStart).inMinutes;
+
+      final stats = Prs1SessionStats.fromEvents(
+        events: events,
+        minutesUsed: minutesUsed,
+      );
+
+      final s = Prs1Session(
+        start: sessionStart,
+        end: sessionEnd,
+        events: events,
+        sourcePath: sourcePath,
+        sourceLabel: detected.name,
+        minutesUsed: minutesUsed,
+        ahi: stats.ahi,
+        pressureMin: stats.pressureMin,
+        pressureMax: stats.pressureMax,
+        leakMedian: stats.leakMedian,
+      );
+
+      return Prs1ParseResult(
+        kind: detected,
+        magic: magic,
+        header: head,
+        device: null,
+        sessions: [s],
+      );
+    }
+
+    return Prs1ParseResult(
+      kind: detected,
+      magic: magic,
+      header: head,
+      device: null,
+      sessions: const [],
+    );
+  }
+}
+
+// ---------------- Chunk parsing (OSCAR-style) ----------------
+
+class _ChunkSummary {
+  _ChunkSummary({required this.sessionId});
+
+  final int sessionId;
+  DateTime? start;
+  DateTime? end;
+  int usageSeconds = 0;
+
+  // Low-rate signal samples (typically per-minute) extracted from event chunks (.002).
+  // These feed the daily aggregator percentile metrics (Leak p95 / Pressure p95).
+  final List<Prs1SignalSample> pressureSamples = <Prs1SignalSample>[];
+  final List<Prs1SignalSample> leakSamples = <Prs1SignalSample>[];
+  final List<Prs1SignalSample> flowLimSamples = <Prs1SignalSample>[];
+
+  /// Best-effort device minimum pressure setting (cmH2O) extracted from settings chunks (.001).
+  double? minPressureSettingCmH2O;
+  final List<double> _minPressureCandidates = <double>[];
+
+  /// Discrete events (OA/CA/H/FL/snore/etc) extracted from event chunks (.002).
+  /// These feed daily AHI and FL summaries.
+  final List<Prs1Event> events = <Prs1Event>[];
+
+  void addSlice(DateTime s, Duration d) {
+    start = (start == null || s.isBefore(start!)) ? s : start;
+    final e = s.add(d);
+    end = (end == null || e.isAfter(end!)) ? e : end;
+    usageSeconds += d.inSeconds;
+  }
+}
+
+List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
+  // For Layer 3 UI we need:
+  // - stable session start/end times
+  // - usage seconds (from interval chunks .005)
+  // - low-rate pressure/leak samples (from event chunks .002) so we can compute p95 metrics.
+  //
+  // This is still *not* full OSCAR parity, but it follows OSCAR's chunk header layout closely
+  // (notably: v3 "normal" chunks contain a checksum byte *after* the hdb block).
+  final bySession = <int, _ChunkSummary>{};
+
+  int u16(int o) => bytes[o] | (bytes[o + 1] << 8);
+  int u32(int o) => bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16) | (bytes[o + 3] << 24);
+
+  DateTime? tsToLocal(int ts) {
+    if (ts < 946684800 || ts > 4102444800) return null; // 2000..2100
+    return DateTime.fromMillisecondsSinceEpoch(ts * 1000, isUtc: true).toLocal();
+  }
+
+  // Parse a v2/v3 chunk header and return (dataStart, hblock).
+  ({int dataStart, Map<int, int> hblock})? parseNormalHeader(int pos, int fileVersion) {
+    // Common 15-byte header already validated by caller.
+    if (fileVersion == 2) {
+      // OSCAR ReadHeader(v2): reads 1 extra byte, then uses bytes[15] as hdb length,
+      // then reads 2*hdb bytes pairs. No checksum byte in v2.
+      if (pos + 16 > bytes.length) return null;
+      final hdbLen = bytes[pos + 15];
+      final hdbStart = pos + 16;
+      final hdbBytes = hdbLen * 2;
+      if (hdbStart + hdbBytes > pos + (bytes[pos + 1] | (bytes[pos + 2] << 8))) return null;
+      final hblock = <int, int>{};
+      int p = hdbStart;
+      for (int i = 0; i < hdbLen; i++) {
+        hblock[bytes[p]] = bytes[p + 1];
+        p += 2;
+      }
+      return (dataStart: p, hblock: hblock);
+    }
+
+    // v3 normal header: extra1 (hdbLen) + header data block (pairs) + checksum byte.
+    if (pos + 16 > bytes.length) return null;
+    final hdbLen = bytes[pos + 15];
+    final hdbStart = pos + 16;
+    final hdbBytes = hdbLen * 2;
+    int p = hdbStart + hdbBytes;
+    if (p + 1 > pos + (bytes[pos + 1] | (bytes[pos + 2] << 8))) return null;
+    final hblock = <int, int>{};
+    int q = hdbStart;
+    for (int i = 0; i < hdbLen; i++) {
+      hblock[bytes[q]] = bytes[q + 1];
+      q += 2;
+    }
+    // Skip checksum byte.
+    p += 1;
+    return (dataStart: p, hblock: hblock);
+  }
+
+  int pos = 0;
+  while (pos + 15 <= bytes.length) {
+    final fileVersion = bytes[pos + 0];
+    if (fileVersion < 2 || fileVersion > 3) break;
+
+    final blockSize = bytes[pos + 1] | (bytes[pos + 2] << 8);
+    if (blockSize <= 0) break;
+    if (pos + blockSize > bytes.length) {
+      // Truncated tail.
+      break;
+    }
+
+    final htype = bytes[pos + 3];
+    final family = bytes[pos + 4];
+    final familyVer = bytes[pos + 5];
+    final ext = bytes[pos + 6];
+    final sessionId = (bytes[pos + 7]) |
+        (bytes[pos + 8] << 8) |
+        (bytes[pos + 9] << 16) |
+        (bytes[pos + 10] << 24);
+    final ts = u32(pos + 11);
+
+    final t = tsToLocal(ts);
+
+    // Ensure a session bucket exists.
+    final summary = bySession.putIfAbsent(sessionId, () => _ChunkSummary(sessionId: sessionId));
+    if (t != null) {
+      // Even normal chunks advance the session time bounds.
+      summary.start = (summary.start == null || t.isBefore(summary.start!)) ? t : summary.start;
+      summary.end = (summary.end == null || t.isAfter(summary.end!)) ? t : summary.end;
+    }
+
+    // Interval / waveform chunk (.005) => compute duration.
+    if (htype == 0x01 && t != null) {
+      // Waveform header starts right after the 15-byte common header.
+      if (pos + 19 <= bytes.length) {
+        final intervalCount = bytes[pos + 15] | (bytes[pos + 16] << 8);
+        final intervalSeconds = bytes[pos + 17];
+        final durationSec = intervalCount * intervalSeconds;
+        if (durationSec > 0 && durationSec < 24 * 3600) {
+          summary.addSlice(t, Duration(seconds: durationSec));
+        }
+      }
+    }
+
+    // Event chunk (.002) => extract per-interval leak/pressure samples.
+    if (htype == 0x00 && ext == 0x02 && t != null) {
+      final hdr = parseNormalHeader(pos, fileVersion);
+      if (hdr != null) {
+        final dataStart = hdr.dataStart;
+        final hblock = hdr.hblock;
+
+        // Only implement the device family we currently target (DreamStation CPAP: family 0, v6).
+        if (family == 0x00 && familyVer == 0x06) {
+          int p = dataStart;
+          int tEpoch = ts; // unix seconds, UTC
+
+          while (p < pos + blockSize) {
+            if (p >= pos + blockSize) break;
+            final code = bytes[p++];
+            if (!hblock.containsKey(code)) {
+              // Unknown event code; stop to avoid desync.
+              break;
+            }
+            final size = hblock[code]!;
+            // Ensure payload within chunk.
+            if (p + size > pos + blockSize) break;
+
+            // All events except 0x12 have a 16-bit delta time prefix.
+            final payloadStart = p;
+            if (code != 0x12) {
+              if (p + 2 > pos + blockSize) break;
+              final dtSec = u16(p);
+              tEpoch += dtSec;
+              p += 2;
+            }
+            // --- Discrete respiratory events (needed for AHI + basic FL counts) ---
+            // OSCAR (prs1_parser_xpap.cpp) ParseEventsF0V6 interprets most respiratory flags as:
+            //   - 2-byte delta-time prefix (already applied to tEpoch)
+            //   - 1-byte "elapsed" indicating how many seconds BEFORE (tEpoch) the event actually occurred.
+            // Mappings (DreamStation CPAP: family 0 v6):
+            //   0x06 -> Obstructive Apnea      (elapsed = payload[0])
+            //   0x07 -> Clear Airway Apnea    (elapsed = payload[0])
+            //   0x0A -> Hypopnea              (elapsed = payload[0])
+            //   0x0B -> Hypopnea (variant)    (elapsed = payload[1])
+            //   0x0C -> Flow Limitation       (elapsed = payload[0])
+            //
+            // Note: hblock[code] "size" includes the delta prefix, so OA/CA/H(0x0A)/FL are commonly size==3.
+            DateTime atEpoch(int epochSec) =>
+                DateTime.fromMillisecondsSinceEpoch(epochSec * 1000, isUtc: true).toLocal();
+
+            int clampEpoch(int epochSec) => (epochSec < 0) ? 0 : epochSec;
+
+            if (code == 0x06 && size >= 3) {
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.obstructiveApnea,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x07 && size >= 3) {
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.clearAirwayApnea,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0A && size >= 3) {
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.hypopnea,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0B && size >= 4) {
+              final elapsedSec = bytes[p + 1];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.hypopnea,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0C && size >= 3) {
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.flowLimitation,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            }
+
+            // Stats record (code 0x11): contains total leak + flex pressure average.
+            // OSCAR: TotalLeakEvent(t, data[pos]); FlexPressureAverageEvent(t, data[pos+2]).
+            // For V6, stats record payload is at least 3 bytes (leak, snore, flexPressureAvg),
+            // and the record includes a 2-byte delta prefix => size >= 5.
+            if (code == 0x11 && size >= 5) {
+              final leak = bytes[p + 0].toDouble();
+              final flexPressureTenth = bytes[p + 2];
+              final pressure = flexPressureTenth / 10.0;
+
+              summary.leakSamples.add(Prs1SignalSample(tEpochSec: tEpoch, value: leak, signalType: Prs1SignalType.leak));
+              summary.pressureSamples.add(Prs1SignalSample(tEpochSec: tEpoch, value: pressure, signalType: Prs1SignalType.pressure));
+            }
+
+            // Advance to next event start. The hblock size already includes the delta prefix.
+            p = payloadStart + size;
+          }
+
+          // Keep deterministic ordering.
+          summary.pressureSamples.sort((a, b) => a.tEpochSec.compareTo(b.tEpochSec));
+          summary.leakSamples.sort((a, b) => a.tEpochSec.compareTo(b.tEpochSec));
+          summary.events.sort((a, b) => a.time.compareTo(b.time));
+        }
+      }
+    }
+
+    // Settings/config chunk (.001) => best-effort extract AutoCPAP minimum pressure setting.
+    //
+    // DreamStation P-series often encodes pressure settings in 0.5 cmH2O steps.
+    // We do not fully decode the settings schema yet; instead we scan payload bytes
+    // for plausible "half-cm" values and use the median as a robust estimate.
+    //
+    // This is used to route/normalize EPAP-like pressure samples into therapy-pressure stats
+    // so our reported Min/Median/P95/Max matches OSCAR's "Pressure Setting" row.
+    if (htype == 0x00 && ext == 0x01 && t != null) {
+      final hdr = parseNormalHeader(pos, fileVersion);
+      if (hdr != null) {
+        final dataStart = hdr.dataStart;
+        final hblock = hdr.hblock;
+
+        int p = dataStart;
+        int tEpoch = ts;
+
+        while (p < pos + blockSize) {
+          final code = bytes[p++];
+          if (!hblock.containsKey(code)) break;
+          final size = hblock[code]!;
+          if (p + size > pos + blockSize) break;
+
+          final payloadStart = p;
+          if (code != 0x12) {
+            if (p + 2 > pos + blockSize) break;
+            final dtSec = u16(p);
+            tEpoch += dtSec;
+            p += 2;
+          }
+
+          // Scan remaining bytes for half-cm pressure values (4.0..20.0 cmH2O).
+          final remain = (payloadStart + size) - p;
+          for (int i = 0; i < remain; i++) {
+            final raw = bytes[p + i];
+            if (raw < 8 || raw > 40) continue; // 4.0..20.0 in 0.5 steps
+            final cm = raw / 2.0;
+            summary._minPressureCandidates.add(cm);
+          }
+
+          p = payloadStart + size;
+        }
+      }
+    }
+
+
+    pos += blockSize;
+  }
+
+  final sessions = <Prs1Session>[];
+  for (final s in bySession.values) {
+    final start = s.start;
+    final end = s.end;
+    if (start == null || end == null) continue;
+    final usedMin = (s.usageSeconds / 60).round();
+
+    // ---- Pressure routing + baseline calibration ---------------------------------
+    // OSCAR's "Pressure Setting" row reports therapy pressure (cmH2O) statistics.
+    // For DreamStation AutoCPAP, our raw per-interval pressure samples are often EPAP-like
+    // (lowered by Flex). To align with OSCAR, we normalize the series so that its minimum
+    // matches the device's configured minimum pressure.
+    //
+    // 1) Extract a best-effort configured min pressure from settings chunks (.001).
+    // 2) Compute epapMin from the raw series.
+    // 3) Apply offset = (configuredMin - epapMin) to the whole series.
+    //    If configuredMin is unavailable, fallback to (epapMin + 2.0) rounded to 0.5.
+    if (s.minPressureSettingCmH2O == null && s._minPressureCandidates.isNotEmpty) {
+      final sorted = List<double>.from(s._minPressureCandidates)..sort();
+      s.minPressureSettingCmH2O = sorted[sorted.length ~/ 2];
+    }
+
+    final epapMin = (s.pressureSamples.isEmpty)
+        ? null
+        : (s.pressureSamples.map((e) => e.value).reduce((a, b) => a < b ? a : b));
+
+    final baseline = (s.minPressureSettingCmH2O != null)
+        ? s.minPressureSettingCmH2O!
+        : ((epapMin != null) ? ((epapMin + 2.0) * 2).round() / 2.0 : null);
+
+    final calibratedPressureSamples = (baseline != null && epapMin != null)
+        ? s.pressureSamples
+            .map((e) => Prs1SignalSample(
+                  tEpochSec: e.tEpochSec,
+                  value: e.value + (baseline - epapMin),
+                  signalType: e.signalType,
+                ))
+            .toList(growable: false)
+        : s.pressureSamples;
+    // -----------------------------------------------------------------------------
+
+    sessions.add(
+      Prs1Session(
+        start: start,
+        end: (s.usageSeconds > 0) ? start.add(Duration(seconds: s.usageSeconds)) : end,
+        events: List.unmodifiable(s.events),
+        pressureSamples: calibratedPressureSamples,
+        leakSamples: s.leakSamples,
+        sourcePath: sourcePath,
+        sourceLabel: 'chunk',
+        minutesUsed: usedMin,
+        ahi: null,
+        pressureMin: null,
+        pressureMax: null,
+        leakMedian: null,
+      ),
+    );
+  }
+
+  // Prefer latest-first.
+  sessions.sort((a, b) => b.start.compareTo(a.start));
+  return sessions;
+}
+
+enum Prs1FileKind {
+  unknown,
+  /// OSCAR-style "chunk" container files (Philips System One): .000/.001/.002/.003/.004/.005 ...
+  /// These are NOT simple frame streams; they contain variable-size chunks with headers.
+  chunk,
+
+  /// Legacy experimental frame streams (kept for backwards compatibility).
+  binary000,
+  binary001,
+  binary002,
+  edf,
+  other,
+  ;
+
+  static Prs1FileKind detect(Uint8List bytes, {String? sourcePath}) {
+    // Prefer file extension when available; it is the most reliable for PRS1.
+    final sp = (sourcePath ?? '').toLowerCase();
+    // Philips System One chunk containers (.000~.005 etc)
+    if (sp.endsWith('.000') || sp.endsWith('.001') || sp.endsWith('.002') || sp.endsWith('.003') || sp.endsWith('.004') || sp.endsWith('.005')) {
+      // Heuristic: chunk header must be present and blockSize must be plausible.
+      if (_looksLikePrs1Chunk(bytes)) return Prs1FileKind.chunk;
+    }
+    if (sp.endsWith('.edf')) return Prs1FileKind.edf;
+
+    // Fallback: sniff EDF header.
+    if (_looksLikeEdf(bytes)) return Prs1FileKind.edf;
+
+    // Content sniff: PRS1 chunk header.
+    if (_looksLikePrs1Chunk(bytes)) return Prs1FileKind.chunk;
+
+    return Prs1FileKind.unknown;
+  }
+
+  static bool _looksLikePrs1Chunk(Uint8List bytes) {
+    if (bytes.length < 16) return false;
+    final fileVersion = bytes[0];
+    if (fileVersion < 2 || fileVersion > 3) return false;
+    final blockSize = bytes[1] | (bytes[2] << 8);
+    if (blockSize < 16 || blockSize > bytes.length) return false;
+    final htype = bytes[3];
+    if (htype != 0x00 && htype != 0x01) return false;
+    return true;
+  }
+
+  static bool _looksLikeEdf(Uint8List bytes) {
+    if (bytes.length < 256) return false;
+
+    // EDF version is 8 ASCII chars; commonly "0       ".
+    final v = String.fromCharCodes(bytes.sublist(0, 8)).trim();
+    if (v.isEmpty) return false;
+
+    // Header bytes field is ASCII int at offset 184, len 8.
+    final hbStr = String.fromCharCodes(bytes.sublist(184, 192)).trim();
+    final hb = int.tryParse(hbStr);
+    if (hb == null || hb < 256 || hb > 16384) return false;
+
+    // Records field at offset 236, len 8 (ASCII int)
+    final recStr = String.fromCharCodes(bytes.sublist(236, 244)).trim();
+    final rec = int.tryParse(recStr);
+    if (rec == null || rec < -1 || rec > 1000000) return false;
+
+    return true;
+  }
+}
+
+
+class Prs1DebugHeader {
+  const Prs1DebugHeader({
+    required this.length,
+    required this.b0,
+    required this.first16,
+  });
+
+  final int length;
+  final int? b0;
+  final Uint8List first16;
+}
+
+class Prs1ParseResult {
+  const Prs1ParseResult({
+    required this.kind,
+    required this.magic,
+    required this.header,
+    required this.device,
+    required this.sessions,
+  });
+
+  final Prs1FileKind kind;
+  final String? magic;
+  final Prs1DebugHeader header;
+  final Prs1Device? device;
+  final List<Prs1Session> sessions;
+}
