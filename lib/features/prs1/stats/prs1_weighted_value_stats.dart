@@ -9,8 +9,8 @@ class Prs1WeightedValueStats {
   static double? weightedQuantile(List<double> values, List<double> weights, double q) {
     if (values.isEmpty || weights.isEmpty || values.length != weights.length) return null;
     if (q.isNaN) return null;
-    if (q <= 0) return _min(values);
-    if (q >= 1) return _max(values);
+
+    final qq = q.clamp(0.0, 1.0);
 
     final pairs = <_Pair>[];
     for (int i = 0; i < values.length; i++) {
@@ -26,14 +26,31 @@ class Prs1WeightedValueStats {
     final totalW = pairs.fold<double>(0.0, (a, p) => a + p.w);
     if (totalW <= 0) return null;
 
-    final target = totalW * q;
+    if (qq <= 0.0) return pairs.first.v;
+    if (qq >= 1.0) return pairs.last.v;
+
+    final target = totalW * qq;
+
     double cum = 0.0;
+    double prevCum = 0.0;
+    double? prevV;
+
     for (final p in pairs) {
+      prevCum = cum;
       cum += p.w;
-      if (cum >= target) return p.v;
+      if (cum >= target) {
+        if (prevV == null) return p.v; // first bucket
+        final span = cum - prevCum; // == p.w
+        if (span <= 0) return p.v;
+        final t = ((target - prevCum) / span).clamp(0.0, 1.0);
+        // Linear interpolation between previous value and current value.
+        return prevV + (p.v - prevV) * t;
+      }
+      prevV = p.v;
     }
     return pairs.last.v;
   }
+
 
   static double? weightedMedian(List<double> values, List<double> weights) => weightedQuantile(values, weights, 0.5);
 

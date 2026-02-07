@@ -11,6 +11,8 @@ import '../features/folder_access/platform/folder_access_ios.dart';
 import '../features/prs1/decode/prs1_loader.dart';
 import '../features/prs1/model/prs1_event.dart';
 import '../features/prs1/model/prs1_session.dart';
+import '../features/prs1/model/prs1_breath.dart';
+import '../features/prs1/model/prs1_waveform_channel.dart';
 import '../features/prs1/model/prs1_signal_sample.dart';
 import '../features/prs1/aggregate/prs1_daily_aggregator.dart';
 import '../features/prs1/aggregate/prs1_trend_aggregator.dart';
@@ -686,6 +688,25 @@ class _HomePageState extends State<HomePage> {
           ? prev.sourcePath
           : s.sourcePath;
 
+      // IMPORTANT: Preserve high-rate waveforms (flowWaveform is required for breath-derived metrics).
+      // Most sessions have waveform only from .005; other files contribute pressure/leak samples.
+      Prs1WaveformChannel? mergedFlowWaveform;
+      if (prev.flowWaveform == null) {
+        mergedFlowWaveform = s.flowWaveform;
+      } else if (s.flowWaveform == null) {
+        mergedFlowWaveform = prev.flowWaveform;
+      } else {
+        // If both exist, keep the one with more samples (avoid double-counting overlaps).
+        mergedFlowWaveform = (prev.flowWaveform!.samples.length >= s.flowWaveform!.samples.length)
+            ? prev.flowWaveform
+            : s.flowWaveform;
+      }
+
+      // Preserve derived breaths if already computed; otherwise keep empty and let aggregators compute later.
+      final mergedBreaths = (prev.breaths.isNotEmpty)
+          ? prev.breaths
+          : (s.breaths.isNotEmpty ? s.breaths : const <Prs1Breath>[]);
+
       byKey[k] = Prs1Session(
         start: mergedStart,
         end: mergedEnd,
@@ -695,7 +716,10 @@ class _HomePageState extends State<HomePage> {
         leakSamples: mergedLeakSamples,
         flowSamples: mergedFlowSamples,
         flexSamples: mergedFlexSamples,
+        flowWaveform: mergedFlowWaveform,
+        breaths: mergedBreaths,
         sourcePath: mergedSourcePath,
+        sourceLabel: 'merged',
       );
     }
 

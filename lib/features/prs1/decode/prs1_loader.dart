@@ -8,6 +8,7 @@ import '../model/prs1_device.dart';
 import '../model/prs1_event.dart';
 import '../model/prs1_session.dart';
 import '../model/prs1_signal_sample.dart';
+import '../model/prs1_waveform_channel.dart';
 import 'edf_decoder.dart';
 import 'frame_decoder.dart';
 import 'event_decoder.dart';
@@ -163,6 +164,12 @@ class _ChunkSummary {
   final List<Prs1SignalSample> leakSamples = <Prs1SignalSample>[];
   final List<Prs1SignalSample> flowLimSamples = <Prs1SignalSample>[];
 
+  // High-rate flow waveform (from interval chunks ext=0x05). Required for breath-derived metrics (MV/RR/TV).
+  final List<double> flowWaveLpm = <double>[];
+  double? flowWaveSampleRateHz;
+  int? flowWaveStartEpochMs;
+
+
   /// Best-effort device minimum pressure setting (cmH2O) extracted from settings chunks (.001).
   double? minPressureSettingCmH2O;
   final List<double> _minPressureCandidates = <double>[];
@@ -267,20 +274,77 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
       summary.end = (summary.end == null || t.isAfter(summary.end!)) ? t : summary.end;
     }
 
-    // Interval / waveform chunk (.005) => compute duration.
+    // Interval / waveform chunk (.005) => compute duration + (ext=0x05) decode flow waveform.
     if (htype == 0x01 && t != null) {
-      // Waveform header starts right after the 15-byte common header.
+      // Follow OSCAR's ReadWaveformHeader layout (prs1_parser.cpp):
+      // fixed 4 bytes: interval_count(u16), interval_seconds(u8), wvfm_signals(u8)
       if (pos + 19 <= bytes.length) {
         final intervalCount = bytes[pos + 15] | (bytes[pos + 16] << 8);
         final intervalSeconds = bytes[pos + 17];
+        final wvfmSignals = bytes[pos + 18];
         final durationSec = intervalCount * intervalSeconds;
         if (durationSec > 0 && durationSec < 24 * 3600) {
           summary.addSlice(t, Duration(seconds: durationSec));
         }
+
+        // DreamStation / PRS1 flow waveform is typically ext=0x05, fileVersion=3, wvfmSignals=1.
+        // Decode raw int8 samples and scale to L/min so breath analyzer can compute MV/RR/TV.
+        if (ext == 0x05 && intervalCount > 0 && intervalSeconds > 0 && wvfmSignals > 0) {
+          int p = pos + 19; // start of waveformInfo array
+          int? flowInterleave;
+          for (int i = 0; i < wvfmSignals; i++) {
+            if (p + (fileVersion == 3 ? 4 : 3) > bytes.length) break;
+            final kind = bytes[p];
+            final interleave = bytes[p + 1] | (bytes[p + 2] << 8);
+            if (fileVersion == 3) {
+              // bytes[p+3] is always_8 (bits per sample), ignore.
+              p += 4;
+            } else {
+              p += 3;
+            }
+            // OSCAR uses `kind` as a channel index; on DreamStation flow is kind==0 when only 1 signal exists.
+            if (kind == 0 && flowInterleave == null) {
+              flowInterleave = interleave;
+            }
+          }
+          if (p + 1 <= bytes.length) {
+            // trailing always_0
+            p += 1;
+          }
+          if (fileVersion == 3 && p + 1 <= bytes.length) {
+            // header additive checksum byte (stored after waveform header)
+            p += 1;
+          }
+
+          final interleave = flowInterleave ?? (bytes[pos + 20] | (bytes[pos + 21] << 8));
+          final sampleRateHz = interleave / intervalSeconds;
+          final sampleCount = intervalCount * interleave;
+
+          final blockEnd = pos + blockSize;
+          int dataEnd = blockEnd;
+          // v3 chunks include CRC32 at end; drop it if present.
+          if (fileVersion == 3 && dataEnd - p >= 4) {
+            dataEnd -= 4;
+          }
+          final dataLen = dataEnd - p;
+          if (sampleCount > 0 && dataLen >= sampleCount) {
+            // Use a conservative scale that matches OSCAR magnitude for PRS1 DreamStation.
+            const double kFlowScaleLpmPerCount = 1.095;
+
+            summary.flowWaveStartEpochMs ??= t.toUtc().millisecondsSinceEpoch;
+            summary.flowWaveSampleRateHz ??= sampleRateHz;
+
+            for (int i = 0; i < sampleCount; i++) {
+              final raw = bytes[p + i];
+              final int s8 = (raw & 0x80) != 0 ? raw - 256 : raw;
+              summary.flowWaveLpm.add(s8 * kFlowScaleLpmPerCount);
+            }
+          }
+        }
       }
     }
 
-    // Event chunk (.002) => extract per-interval leak/pressure samples.
+// Event chunk (.002) => extract per-interval leak/pressure samples.
     if (htype == 0x00 && ext == 0x02 && t != null) {
       final hdr = parseNormalHeader(pos, fileVersion);
       if (hdr != null) {
@@ -505,13 +569,25 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
         : s.pressureSamples;
     // -----------------------------------------------------------------------------
 
-    sessions.add(
+    
+    final flowWf = (s.flowWaveLpm.isNotEmpty && (s.flowWaveSampleRateHz ?? 0) > 0)
+        ? Prs1WaveformChannel(
+            startEpochMs: s.flowWaveStartEpochMs ?? start.toUtc().millisecondsSinceEpoch,
+            sampleRateHz: s.flowWaveSampleRateHz ?? 5.0,
+            samples: Float32List.fromList(s.flowWaveLpm.map((e) => e.toDouble()).toList(growable: false)),
+            unit: 'L/min',
+            label: 'Flow',
+          )
+        : null;
+
+sessions.add(
       Prs1Session(
         start: start,
         end: (s.usageSeconds > 0) ? start.add(Duration(seconds: s.usageSeconds)) : end,
         events: List.unmodifiable(s.events),
         pressureSamples: calibratedPressureSamples,
         leakSamples: s.leakSamples,
+        flowWaveform: flowWf,
         sourcePath: sourcePath,
         sourceLabel: 'chunk',
         minutesUsed: usedMin,

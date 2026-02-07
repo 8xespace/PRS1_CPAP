@@ -25,6 +25,50 @@ class _StatRow {
   });
 }
 
+/// 給一般使用者看的「核心指標」：整晚 AHI（與 OSCAR Daily AHI 對齊）。
+class _AhiBanner extends StatelessWidget {
+  const _AhiBanner({required this.ahi});
+
+  final double? ahi;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final v = ahi;
+    final text = v == null ? '—' : v.toStringAsFixed(2);
+
+    // 用品牌色的深色調，維持你偏好的沉穩酒紅感。
+    final bg = const Color(0xFF7A3E54);
+    final fg = theme.colorScheme.onPrimary;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            blurRadius: 12,
+            spreadRadius: 0,
+            offset: const Offset(0, 6),
+            color: Colors.black.withOpacity(0.10),
+          ),
+        ],
+      ),
+      child: Center(
+        child: Text(
+          '呼吸中止指數 (AHI)：$text',
+          style: theme.textTheme.titleLarge?.copyWith(
+            color: fg,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.2,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class Prs1DashboardPage extends StatefulWidget {
   const Prs1DashboardPage({super.key});
 
@@ -59,9 +103,9 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
     final b = last7[_selectedIndex];
     final ymdLabel = _formatDateToChinese(b.day);
 
-    // rollingAhi5m 的 value 可能為 null（某些夜晚沒有計算點），統計時要先濾掉。
-    final ahiValues = b.rollingAhi5m.map((e) => e.value).whereType<double>().toList();
-    final ahiStats = _statsOfValues(ahiValues);
+    // AHI：使用「整晚平均」(OA + CA + H) / 小時，與 OSCAR 的 Daily AHI 對齊。
+    // 注意：rollingAhi5m/30m 的最大值可能會「爆表」，不適合作為給一般用戶看的核心數字。
+    final double? nightlyAhi = b.ahi;
 
     // 這個欄位在模型中允許為 null；null 就讓 UI 顯示「—」。
     final double? leakOverPct = (b.leakPercentOverThreshold == null)
@@ -82,7 +126,7 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
       _StatRow('I:E 比', unit: '', min: b.ieRatioMin, median: b.ieRatioMedian, p95: b.ieRatioP95, max: b.ieRatioMax),
       _StatRow('面罩漏氣率', unit: 'L/min', min: b.leakMin, median: b.leakMedian, p95: b.leakP95, max: b.leakMax),
       _StatRow('漏氣超過閾值的比例', unit: '%', min: leakOverPct, median: leakOverPct, p95: leakOverPct, max: leakOverPct),
-      _StatRow('呼吸中止指數', unit: '', min: ahiStats.min, median: ahiStats.median, p95: ahiStats.p95, max: ahiStats.max),
+      _StatRow('呼吸中止指數 (AHI)', unit: '', min: nightlyAhi, median: nightlyAhi, p95: nightlyAhi, max: nightlyAhi),
       _StatRow('氣流受限值', unit: '', min: b.flowLimitationMin, median: b.flowLimitationMedian, p95: b.flowLimitationP95, max: b.flowLimitationMax),
     ];
 
@@ -110,6 +154,9 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
                 selectedIndex: _selectedIndex,
                 onSelect: (i) => setState(() => _selectedIndex = i),
               ),
+              const SizedBox(height: 14),
+              // 一般用戶最直覺關心的核心指標：整晚 AHI（與 OSCAR 對齊）。
+              _AhiBanner(ahi: nightlyAhi),
               const SizedBox(height: 14),
               // 下方統計資料框獨立滾動（並凍結欄位標題列）。
               Expanded(

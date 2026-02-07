@@ -56,6 +56,14 @@ class Prs1DailyBucket {
     this.pressureBiasPctMedian,
     this.pressureBiasPctP95,
     this.pressureBiasPctMax,
+    this.minuteVentOscarMin,
+    this.minuteVentOscarMedian,
+    this.minuteVentOscarP95,
+    this.minuteVentOscarMax,
+    this.minuteVentBiasPctMin,
+    this.minuteVentBiasPctMedian,
+    this.minuteVentBiasPctP95,
+    this.minuteVentBiasPctMax,
     required this.leakMedian,
     required this.leakMin,
     required this.leakMax,
@@ -166,6 +174,18 @@ class Prs1DailyBucket {
   final double? pressureBiasPctMedian;
   final double? pressureBiasPctP95;
   final double? pressureBiasPctMax;
+
+  // MV (Minute Ventilation) OSCAR-mode verification
+  final double? minuteVentOscarMin;
+  final double? minuteVentOscarMedian;
+  final double? minuteVentOscarP95;
+  final double? minuteVentOscarMax;
+
+  // bias% = (thisApp - oscar) / oscar * 100
+  final double? minuteVentBiasPctMin;
+  final double? minuteVentBiasPctMedian;
+  final double? minuteVentBiasPctP95;
+  final double? minuteVentBiasPctMax;
 
 
   // Leak (if leak samples are available; otherwise null).

@@ -35,14 +35,29 @@ class WeightedStats {
 
     filtered.sort((a, b) => a.value.compareTo(b.value));
 
+    if (qq <= 0.0) return filtered.first.value;
+    if (qq >= 1.0) return filtered.last.value;
+
     final target = total * qq;
     var cum = 0.0;
+    var prevCum = 0.0;
+    double? prevV;
+
     for (final p in filtered) {
+      prevCum = cum;
       cum += p.weightSeconds;
-      if (cum >= target) return p.value;
+      if (cum >= target) {
+        if (prevV == null) return p.value;
+        final span = cum - prevCum; // == weightSeconds of current p
+        if (span <= 0) return p.value;
+        final t = ((target - prevCum) / span).clamp(0.0, 1.0);
+        return prevV + (p.value - prevV) * t;
+      }
+      prevV = p.value;
     }
     return filtered.last.value;
   }
+
 
   static double? median(List<WeightedPoint> points) => quantile(points, 0.5);
 

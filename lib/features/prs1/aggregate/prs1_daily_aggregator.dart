@@ -285,6 +285,19 @@ class _MutableBucket {
   double? respRateP95;
   double? minuteVentMedian;
   double? minuteVentP95;
+
+  double? tidalVolumeMin;
+  double? tidalVolumeMax;
+  double? respRateMin;
+  double? respRateMax;
+  double? minuteVentMin;
+  double? minuteVentMax;
+  double? inspTimeMin;
+  double? inspTimeMax;
+  double? expTimeMin;
+  double? expTimeMax;
+  double? ieRatioMin;
+  double? ieRatioMax;
   double? inspTimeMedian;
   double? inspTimeP95;
   double? expTimeMedian;
@@ -434,7 +447,7 @@ class _MutableBucket {
     leakMin = _minIntervalValue(leakIntervals);
     leakMax = _maxIntervalValue(leakIntervals);
     final fracOver = _fractionOverFromIntervals(leakIntervals, cfg.leakOverThreshold);
-    leakPercentOver = (fracOver == null) ? null : (fracOver * 100.0);
+    leakPercentOver = fracOver;
 
     // Leak over-threshold episodes (segments), for OSCAR-like analysis beyond %time.
     leakEpisodes = Prs1ValueEpisodes.fromIntervalsOverThreshold(
@@ -462,7 +475,13 @@ class _MutableBucket {
       if (wf == null) continue;
 
       // Use cached breaths if present; otherwise segment on demand.
-      final breathList = sess.breaths.isNotEmpty ? sess.breaths : Prs1BreathAnalyzer.segmentBreaths(wf);
+      final breathList = sess.breaths.isNotEmpty
+          ? sess.breaths
+          : Prs1BreathAnalyzer.segmentBreaths(
+              wf,
+              leak: sess.leakWaveform,
+              leakOverThreshold: cfg.leakOverThreshold,
+            );
 
       final slStartMs = sl.start.toUtc().millisecondsSinceEpoch;
       final slEndMs = sl.end.toUtc().millisecondsSinceEpoch;
@@ -473,7 +492,7 @@ class _MutableBucket {
         final dur = b.durationSec;
         if (dur <= 0) continue;
 
-        tv.add(b.tidalVolumeLiters);
+        tv.add(b.tidalVolumeLiters * 1000.0);
         rr.add(b.respRateBpm);
         mv.add(b.minuteVentilationLpm);
         inspT.add(b.inspTimeSec);
@@ -486,6 +505,25 @@ class _MutableBucket {
     if (tv.isNotEmpty) {
       tidalVolumeMedian = Prs1WeightedValueStats.weightedMedian(tv, w);
       tidalVolumeP95 = Prs1WeightedValueStats.weightedQuantile(tv, w, 0.95);
+
+      tidalVolumeMin = Prs1WeightedValueStats.min(tv);
+      tidalVolumeMax = Prs1WeightedValueStats.max(tv);
+
+      respRateMin = Prs1WeightedValueStats.min(rr);
+      respRateMax = Prs1WeightedValueStats.max(rr);
+
+      minuteVentMin = Prs1WeightedValueStats.min(mv);
+      minuteVentMax = Prs1WeightedValueStats.max(mv);
+
+      inspTimeMin = Prs1WeightedValueStats.min(inspT);
+      inspTimeMax = Prs1WeightedValueStats.max(inspT);
+
+      expTimeMin = Prs1WeightedValueStats.min(expT);
+      expTimeMax = Prs1WeightedValueStats.max(expT);
+
+      ieRatioMin = Prs1WeightedValueStats.min(ie);
+      ieRatioMax = Prs1WeightedValueStats.max(ie);
+
 
       respRateMedian = Prs1WeightedValueStats.weightedMedian(rr, w);
       respRateP95 = Prs1WeightedValueStats.weightedQuantile(rr, w, 0.95);
@@ -651,14 +689,12 @@ class _MutableBucket {
       windowMinutes: 30,
     );
 
-    // OEM apps commonly present the night AHI as the *peak* AHI observed during the night,
-    // rather than the whole-night average. We approximate this as the maximum rolling AHI
-    // over a 30-minute window, ignoring minutes with no usage (null points).
-    final peakAhi30m = rollingAhi30m
-        .map((p) => p.value)
-        .whereType<double>()
-        .fold<double?>(null, (prev, v) => (prev == null || v > prev) ? v : prev);
-    if (peakAhi30m != null) ahi = peakAhi30m;
+    // IMPORTANT:
+    // For user-facing "AHI" we must match OSCAR / standard definition:
+    //   AHI = (OA + CA + H) / hoursUsed
+    // The earlier version overwrote the whole-night average with a *peak* rolling AHI
+    // (e.g. 30-minute window max), which can easily produce scary / untrustworthy values.
+    // We keep the whole-night AHI computed above and do NOT override it here.
 
   }
 
@@ -749,23 +785,43 @@ double? _maxValueFromIntervals(List<Prs1WeightedInterval<double>> intervals) {
   return m;
 }
 
-double? _weightedQuantileFromIntervals(List<Prs1WeightedInterval<double>> intervals, double q) {
+  double? _weightedQuantileFromIntervals(List<Prs1WeightedInterval<double>> intervals, double q) {
     if (intervals.isEmpty) return null;
     final qq = q.clamp(0.0, 1.0);
-    final totalW = intervals.fold<int>(0, (acc, it) => acc + it.seconds);
+
+    final positive = intervals.where((it) => it.seconds > 0).toList(growable: false);
+    if (positive.isEmpty) return null;
+
+    final totalW = positive.fold<int>(0, (acc, it) => acc + it.seconds);
     if (totalW <= 0) return null;
 
-    final sorted = List<Prs1WeightedInterval<double>>.from(intervals)
+    final sorted = List<Prs1WeightedInterval<double>>.from(positive)
       ..sort((a, b) => a.value.compareTo(b.value));
 
+    if (qq <= 0.0) return sorted.first.value;
+    if (qq >= 1.0) return sorted.last.value;
+
     final target = totalW * qq;
+
     int cum = 0;
+    int prevCum = 0;
+    double? prevV;
+
     for (final it in sorted) {
+      prevCum = cum;
       cum += it.seconds;
-      if (cum >= target) return it.value;
+      if (cum >= target) {
+        if (prevV == null) return it.value;
+        final span = cum - prevCum; // == it.seconds
+        if (span <= 0) return it.value;
+        final t = ((target - prevCum) / span).clamp(0.0, 1.0);
+        return prevV + (it.value - prevV) * t;
+      }
+      prevV = it.value;
     }
     return sorted.last.value;
   }
+
 
   static double? _fractionOverFromIntervals(List<Prs1WeightedInterval<double>> intervals, double threshold) {
     if (intervals.isEmpty) return null;
@@ -830,28 +886,36 @@ double? _weightedQuantileFromIntervals(List<Prs1WeightedInterval<double>> interv
       tidalVolumeP95: tidalVolumeP95,
       // Min/Max are not yet explicitly decoded; for now we approximate with
       // available stats so the engine and UI remain functional.
-      tidalVolumeMin: tidalVolumeMedian,
-      tidalVolumeMax: (tidalVolumeP95 ?? tidalVolumeMedian),
+      tidalVolumeMin: tidalVolumeMin,
+      tidalVolumeMax: tidalVolumeMax,
       respRateMedian: respRateMedian,
       respRateP95: respRateP95,
-      respRateMin: respRateMedian,
-      respRateMax: (respRateP95 ?? respRateMedian),
+      respRateMin: respRateMin,
+      respRateMax: respRateMax,
       minuteVentMedian: minuteVentMedian,
       minuteVentP95: minuteVentP95,
-      minuteVentMin: minuteVentMedian,
-      minuteVentMax: (minuteVentP95 ?? minuteVentMedian),
+      minuteVentMin: minuteVentMin,
+      minuteVentMax: minuteVentMax,
+      minuteVentOscarMin: null,
+      minuteVentOscarMedian: null,
+      minuteVentOscarP95: null,
+      minuteVentOscarMax: null,
+      minuteVentBiasPctMin: null,
+      minuteVentBiasPctMedian: null,
+      minuteVentBiasPctP95: null,
+      minuteVentBiasPctMax: null,
       inspTimeMedian: inspTimeMedian,
       inspTimeP95: inspTimeP95,
-      inspTimeMin: inspTimeMedian,
-      inspTimeMax: (inspTimeP95 ?? inspTimeMedian),
+      inspTimeMin: inspTimeMin,
+      inspTimeMax: inspTimeMax,
       expTimeMedian: expTimeMedian,
       expTimeP95: expTimeP95,
-      expTimeMin: expTimeMedian,
-      expTimeMax: (expTimeP95 ?? expTimeMedian),
+      expTimeMin: expTimeMin,
+      expTimeMax: expTimeMax,
       ieRatioMedian: ieRatioMedian,
       ieRatioP95: ieRatioP95,
-      ieRatioMin: ieRatioMedian,
-      ieRatioMax: (ieRatioP95 ?? ieRatioMedian),
+      ieRatioMin: ieRatioMin,
+      ieRatioMax: ieRatioMax,
       flowLimitationMedian: flowLimitationMedian,
       flowLimitationP95: flowLimitationP95,
       flowLimitationMin: flowLimitationMedian,
