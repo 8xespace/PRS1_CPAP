@@ -86,12 +86,13 @@ class Prs1DailyAggregator {
     Map<DateTime, _MutableBucket> buckets,
     List<Prs1SignalSample> samples,
     Prs1SignalType expectedType,
+    {DateTime? anchorDay}
   ) {
     if (samples.isEmpty) return;
     for (final sm in samples) {
       if (sm.signalType != expectedType) continue;
       final t = sm.timeLocal;
-      final day = _dayKey(t);
+      final day = anchorDay ?? _dayKey(t);
       final b = buckets[day];
       if (b == null) continue;
       if (!b.containsTime(t)) continue;
@@ -99,6 +100,9 @@ class Prs1DailyAggregator {
       switch (expectedType) {
         case Prs1SignalType.pressure:
           b.pressureSamples.add(sm);
+          break;
+        case Prs1SignalType.exhalePressure:
+          b.exhalePressureSamples.add(sm);
           break;
         case Prs1SignalType.leak:
           b.leakSamples.add(sm);
@@ -160,50 +164,39 @@ class Prs1DailyAggregator {
 
     // Gather day range.
     DateTime minStart = sessions.first.start;
-    DateTime maxEnd = sessions.first.end;
+    DateTime maxStart = sessions.first.start;
     for (final s in sessions) {
       if (s.start.isBefore(minStart)) minStart = s.start;
-      if (s.end.isAfter(maxEnd)) maxEnd = s.end;
+      if (s.start.isAfter(maxStart)) maxStart = s.start;
     }
 
     final startDay = _dayKey(minStart);
-    final endDay = _dayKey(maxEnd);
+    final endDay = _dayKey(maxStart);
 
     // Build buckets for all days in range.
     final buckets = <DateTime, _MutableBucket>{};
     DateTime cur = startDay;
     while (!cur.isAfter(endDay)) {
-      buckets[cur] = _MutableBucket(cur);
+      buckets[cur] = _MutableBucket(cur, config);
       cur = cur.add(const Duration(days: 1));
     }
 
-    // 1) Build session slices per day (accurate usage time).
+    // 1) Build session slices per *session-start day* (OSCAR-style nightly grouping).
+    //    This keeps a single sleep session together even if it crosses midnight.
     for (final s in sessions) {
-      DateTime segStart = s.start;
-      final segEndAll = s.end;
-
-      while (segStart.isBefore(segEndAll)) {
-        final day = _dayKey(segStart);
-        final nextMidnight = day.add(const Duration(days: 1));
-        final segEnd = segEndAll.isBefore(nextMidnight) ? segEndAll : nextMidnight;
-
-        final b = buckets[day];
-        if (b != null) {
-          b.addSlice(Prs1SessionSlice(session: s, start: segStart, end: segEnd));
-        }
-
-        segStart = segEnd;
-      }
+      final day = _dayKey(s.start);
+      final b = buckets[day];
+      if (b == null) continue;
+      b.addSlice(Prs1SessionSlice(session: s, start: s.start, end: s.end));
     }
 
-    // 2) Bucketize events by absolute time (clamp to day).
+// 2) Bucketize events by absolute time (clamp to day).
     for (final s in sessions) {
+      final day = _dayKey(s.start);
+      final b = buckets[day];
+      if (b == null) continue;
       for (final e in s.events) {
-        final day = _dayKey(e.time);
-        final b = buckets[day];
-        if (b == null) continue;
-
-        // Only keep events that fall within some session slice in this day (guard).
+        // Keep all events within the session window (even across midnight).
         if (!b.containsTime(e.time)) continue;
         b.addEvent(e);
       }
@@ -213,8 +206,9 @@ class Prs1DailyAggregator {
     //
     // This establishes the data channel needed for L8 statistics (median/p95/%over-threshold).
     for (final s in sessions) {
-      _bucketizeSamples(buckets, s.pressureSamples, Prs1SignalType.pressure);
-      _bucketizeSamples(buckets, s.leakSamples, Prs1SignalType.leak);
+      _bucketizeSamples(buckets, s.pressureSamples, Prs1SignalType.pressure, anchorDay: _dayKey(s.start));
+      _bucketizeSamples(buckets, s.exhalePressureSamples, Prs1SignalType.exhalePressure);
+      _bucketizeSamples(buckets, s.leakSamples, Prs1SignalType.leak, anchorDay: _dayKey(s.start));
       _bucketizeSamples(buckets, s.flowSamples, Prs1SignalType.flowRate);
       _bucketizeSamples(buckets, s.flexSamples, Prs1SignalType.flexActive);
 
@@ -235,13 +229,26 @@ class Prs1DailyAggregator {
 }
 
 class _MutableBucket {
-  _MutableBucket(this.day);
+  _MutableBucket(this.day, this.cfg) : largeLeakThresholdLpm = cfg.leakOverThreshold; // fallback; will be overwritten by total-leak mean (OSCAR dashed line)
 
   final DateTime day;
+  final Prs1DailyAggregationConfig cfg;
   final List<Prs1SessionSlice> slices = [];
   final List<Prs1Event> events = [];
   final List<Prs1SignalSample> pressureSamples = [];
+  final List<Prs1SignalSample> exhalePressureSamples = [];
   final List<Prs1SignalSample> leakSamples = [];
+  final List<Prs1SignalSample> unintentionalLeakSamples = [];
+  double? leakBaselineLpm;
+
+  /// Large-leak threshold expressed on the **total leak** axis (L/min).
+  ///
+  /// Default is [Prs1DailyAggregationConfig.leakOverThreshold]. When baseline/intentional
+  /// leak is estimated, this becomes: baseline + cfg.leakOverThreshold.
+  double largeLeakThresholdLpm;
+
+  // Legacy constant kept for reference only. Do not use in new logic.
+  static const double kLargeLeakThresholdLpm = 24.0;
   final List<Prs1SignalSample> flowSamples = [];
   final List<Prs1SignalSample> flexSamples = [];
   final Map<Prs1EventType, int> counts = {};
@@ -260,6 +267,11 @@ class _MutableBucket {
   double? pressureMedian;
   double? pressureP95;
   double? pressureMax;
+
+  double? epapMin;
+  double? epapMedian;
+  double? epapP95;
+  double? epapMax;
 
   // OSCAR reference + bias (optional, validation only)
   double? pressureOscarMin;
@@ -435,6 +447,17 @@ class _MutableBucket {
     pressureMedian = _weightedQuantileFromIntervals(pressureIntervals, 0.5);
     pressureP95 = _weightedQuantileFromIntervals(pressureIntervals, 0.95);
 
+    // EPAP/Flex (green line) stats.
+    final epapIntervals = _numericIntervalsWithinSlices(
+      samples: exhalePressureSamples,
+      slices: slices,
+      cfg: cfg,
+    );
+    epapMin = _minIntervalValue(epapIntervals);
+    epapMax = _maxIntervalValue(epapIntervals);
+    epapMedian = _weightedQuantileFromIntervals(epapIntervals, 0.5);
+    epapP95 = _weightedQuantileFromIntervals(epapIntervals, 0.95);
+
     // Leak stats (median/95/% over threshold).
     final leakIntervals = _numericIntervalsWithinSlices(
       samples: leakSamples,
@@ -446,13 +469,76 @@ class _MutableBucket {
     // Also compute min/max for OSCAR-like summary table.
     leakMin = _minIntervalValue(leakIntervals);
     leakMax = _maxIntervalValue(leakIntervals);
-    final fracOver = _fractionOverFromIntervals(leakIntervals, cfg.leakOverThreshold);
+
+    // DreamStation provides **total leak** samples. OSCAR's dashed "Large Leak" line is
+    // typically expressed on the *total leak* axis, and will vary by night because
+    // baseline/intentional leak (mask vent) varies with pressure/mask.
+    //
+    // We estimate baseline/intentional leak as a low-percentile of total leak over the
+    // whole night, then define the per-bucket large-leak threshold as:
+    //   thresholdTotal = baseline + cfg.leakOverThreshold
+    // where cfg.leakOverThreshold is the conventional unintentional leak threshold (e.g. 24 L/min).
+    // Use bucket-scoped threshold so UI & summary table can reflect nightly changes.
+    largeLeakThresholdLpm = cfg.leakOverThreshold; // fallback; will be overwritten by total-leak mean (OSCAR dashed line)
+
+    // Derive an OSCAR-like "Leak Rate" (unintentional) series.
+    // OSCAR's black line is *not* simply "Total - constant". It behaves like
+    // Total Leaks minus an estimated intentional/baseline leak that depends on
+    // pressure/mask venting. When the derived unintentional leak is ~0 all night,
+    // the black line effectively "disappears" (matching what you observed).
+    if (leakSamples.isNotEmpty) {
+      final totalVals = leakSamples
+          .map((e) => e.value)
+          .whereType<double>()
+          .where((v) => v.isFinite)
+          .toList();
+
+      if (totalVals.isEmpty) {
+        leakBaselineLpm = null;
+        largeLeakThresholdLpm = cfg.leakOverThreshold; // safe fallback
+        unintentionalLeakSamples..clear();
+      } else {
+        // Keep your requested behavior: dashed threshold = nightly Total-Leaks mean.
+        final mean = totalVals.reduce((a, b) => a + b) / totalVals.length;
+        largeLeakThresholdLpm = mean.isFinite ? mean : cfg.leakOverThreshold;
+
+        // Build a pressure-dependent "intentional leak" model using the lower envelope
+        // of Total Leaks across pressure bins.
+        final model = _MutableBucket._estimateIntentionalLeakModel(
+          totalLeakSamples: leakSamples,
+          pressureSamples: pressureSamples,
+        );
+        leakBaselineLpm = model?.baselineAtMedianPressure;
+
+        unintentionalLeakSamples
+          ..clear()
+          ..addAll(
+            leakSamples.map(
+              (s) {
+                final p = _MutableBucket._valueAtTimestampMs(pressureSamples, s.timestampMs);
+                final expected = (model != null && p != null)
+                    ? (model.intercept + model.slope * p)
+                    : (model?.baselineAtMedianPressure ?? 0.0);
+                final v = s.value - expected;
+                return Prs1SignalSample(
+                  timestampMs: s.timestampMs,
+                  value: (v.isFinite && v > 0) ? v : 0.0,
+                  signalType: Prs1SignalType.leak,
+                );
+              },
+            ),
+          );
+      }
+    }
+
+    // % time over large-leak threshold (on total-leak axis).
+    final fracOver = _fractionOverFromIntervals(leakIntervals, largeLeakThresholdLpm);
     leakPercentOver = fracOver;
 
     // Leak over-threshold episodes (segments), for OSCAR-like analysis beyond %time.
     leakEpisodes = Prs1ValueEpisodes.fromIntervalsOverThreshold(
       leakIntervals,
-      threshold: cfg.leakOverThreshold,
+      threshold: largeLeakThresholdLpm,
       minDurationSec: 30,
       gapToleranceSec: 5,
     );
@@ -850,13 +936,133 @@ double? _maxValueFromIntervals(List<Prs1WeightedInterval<double>> intervals) {
       endEpochSec: null,
     );
   }
+
+  /// Returns the last sample value at or before [timestampMs].
+  /// Assumes [samples] are sorted by timestampMs.
+  static double? _valueAtTimestampMs(List<Prs1SignalSample> samples, int timestampMs) {
+    if (samples.isEmpty) return null;
+
+    int lo = 0;
+    int hi = samples.length - 1;
+
+    // Fast bounds.
+    if (timestampMs < samples.first.timestampMs) return null;
+    if (timestampMs >= samples.last.timestampMs) return samples.last.value;
+
+    while (lo <= hi) {
+      final mid = (lo + hi) >> 1;
+      final t = samples[mid].timestampMs;
+      if (t == timestampMs) {
+        return samples[mid].value;
+      } else if (t < timestampMs) {
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    // hi is the index of the last element < timestampMs.
+    if (hi < 0) return null;
+    return samples[hi].value;
+  }
+
+  /// Estimate the *intentional* (mask vent) leak baseline from Total Leaks + Pressure,
+  /// so we can compute an OSCAR-like "Leak Rate" (unintentional) as:
+  ///   max(0, total - intentional(pressure)).
+  ///
+  /// OSCAR's black line often disappears on nights where leak rate stays ~0.
+  /// This model aims to reproduce that behavior without requiring mask metadata.
+  static ({double intercept, double slope, double baselineAtMedianPressure}) _estimateIntentionalLeakModel({
+    required List<Prs1SignalSample> totalLeakSamples,
+    required List<Prs1SignalSample> pressureSamples,
+      }) {
+    if (totalLeakSamples.isEmpty || pressureSamples.isEmpty) {
+      return (intercept: 0.0, slope: 0.0, baselineAtMedianPressure: 0.0);
+    }
+
+    // Build (pressure, totalLeak) pairs where both channels are defined.
+    // Note: totalLeakSamples is already session-scoped in this codebase, so we do not
+    // need an additional "slices" clamp here.
+    final pairs = <({double p, double leak})>[];
+    for (final s in totalLeakSamples) {
+      final t = s.timestampMs;
+      final p = _valueAtTimestampMs(pressureSamples, t);
+      if (p == null) continue;
+      if (!s.value.isFinite || !p.isFinite) continue;
+      pairs.add((p: p, leak: s.value));
+    }
+
+
+    if (pairs.length < 10) {
+      // Fallback: use a low percentile as a constant baseline.
+      final leaks = pairs.map((e) => e.leak).toList()..sort();
+      final idx = (leaks.length * 0.2).floor().clamp(0, leaks.length - 1);
+      final base = leaks.isEmpty ? 0.0 : leaks[idx];
+      return (intercept: base, slope: 0.0, baselineAtMedianPressure: base);
+    }
+
+    // Bin by pressure (0.5 cmH2O steps), take lower-envelope (20th percentile) per bin.
+    const binSize = 0.5;
+    final bins = <double, List<double>>{};
+    for (final e in pairs) {
+      final key = (e.p / binSize).roundToDouble() * binSize;
+      (bins[key] ??= <double>[]).add(e.leak);
+    }
+
+    final xs = <double>[];
+    final ys = <double>[];
+    for (final entry in bins.entries) {
+      final v = entry.value;
+      if (v.length < 4) continue; // too sparse
+      v.sort();
+      final idx = (v.length * 0.2).floor().clamp(0, v.length - 1);
+      xs.add(entry.key);
+      ys.add(v[idx]);
+    }
+
+    if (xs.length < 2) {
+      final leaks = pairs.map((e) => e.leak).toList()..sort();
+      final idx = (leaks.length * 0.2).floor().clamp(0, leaks.length - 1);
+      final base = leaks.isEmpty ? 0.0 : leaks[idx];
+      return (intercept: base, slope: 0.0, baselineAtMedianPressure: base);
+    }
+
+    // Simple least-squares fit: leak = a + b * pressure
+    final n = xs.length;
+    double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0;
+    for (int i = 0; i < n; i++) {
+      final x = xs[i];
+      final y = ys[i];
+      sumX += x;
+      sumY += y;
+      sumXX += x * x;
+      sumXY += x * y;
+    }
+    final denom = (n * sumXX - sumX * sumX);
+    final slope = denom.abs() < 1e-9 ? 0.0 : (n * sumXY - sumX * sumY) / denom;
+    final intercept = (sumY - slope * sumX) / n;
+
+    // Baseline at median pressure in the pairs.
+    final ps = pairs.map((e) => e.p).toList()..sort();
+    final pMed = ps[ps.length ~/ 2];
+    final baseAtMed = (intercept + slope * pMed).clamp(0.0, double.infinity);
+
+    return (
+      intercept: intercept,
+      slope: slope,
+      baselineAtMedianPressure: baseAtMed,
+    );
+  }
   Prs1DailyBucket freeze() {
     return Prs1DailyBucket(
       day: day,
       slices: List.unmodifiable(slices),
       events: List.unmodifiable(events),
       pressureSamples: List.unmodifiable(pressureSamples),
+      exhalePressureSamples: List.unmodifiable(exhalePressureSamples),
       leakSamples: List.unmodifiable(leakSamples),
+      unintentionalLeakSamples: List.unmodifiable(unintentionalLeakSamples),
+      leakBaselineLpm: leakBaselineLpm,
+      largeLeakThresholdLpm: largeLeakThresholdLpm,
       flowSamples: List.unmodifiable(flowSamples),
       flexSamples: List.unmodifiable(flexSamples),
       usageSeconds: usageSeconds,
@@ -869,6 +1075,10 @@ double? _maxValueFromIntervals(List<Prs1WeightedInterval<double>> intervals) {
       pressureMedian: pressureMedian,
       pressureP95: pressureP95,
       pressureMax: pressureMax,
+      epapMin: epapMin,
+      epapMedian: epapMedian,
+      epapP95: epapP95,
+      epapMax: epapMax,
       pressureOscarMin: pressureOscarMin,
       pressureOscarMedian: pressureOscarMedian,
       pressureOscarP95: pressureOscarP95,

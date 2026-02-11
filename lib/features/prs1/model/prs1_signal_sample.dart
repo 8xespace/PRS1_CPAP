@@ -11,12 +11,20 @@
 /// - For bucketing we expose a convenient local-time [timeLocal].
 class Prs1SignalSample {
   const Prs1SignalSample({
-    required this.tEpochSec,
+    int? tEpochSec,
+    int? timestampMs,
     required this.value,
     required this.signalType,
-  });
+  })  : assert((tEpochSec != null) ^ (timestampMs != null),
+            'Provide exactly one of tEpochSec or timestampMs.'),
+        tEpochSec = tEpochSec ?? (timestampMs! ~/ 1000),
+        timestampMs = timestampMs ?? (tEpochSec! * 1000);
 
+  /// Epoch seconds (UTC) used throughout the aggregation layer.
   final int tEpochSec;
+
+  /// Epoch milliseconds (UTC). Kept to make wiring from waveform samples easy.
+  final int timestampMs;
   final double value;
   final Prs1SignalType signalType;
 
@@ -31,6 +39,8 @@ class Prs1SignalSample {
 enum Prs1SignalType {
   flowRate,
   pressure,
+  /// Flex / EPAP-like (OSCAR green line)
+  exhalePressure,
   leak,
   flexActive,
 }

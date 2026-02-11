@@ -12,10 +12,16 @@ enum Prs1EventType {
   flowLimitation,
   snore,
   periodicBreathing,
+  variableBreathing,
+  rera,
+  vibratorySnore,
+  vibratorySnore2,
+  breathNotDetected,
 
   // Therapy/metrics
   largeLeak,
   pressureChange,
+  pressurePulse, // PP
 
   // Continuous channels (future)
   pressureSample,

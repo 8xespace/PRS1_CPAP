@@ -11,6 +11,17 @@ import 'features/prs1/waveform/prs1_waveform_index.dart';
 
 
 
+
+/// Engine phase for long-running pipeline (scan/read -> compute -> done).
+/// Used to drive UX hints and ensure state transitions are explicit.
+enum EnginePhase {
+  idle,
+  scanning,
+  computing,
+  done,
+  error,
+}
+
 ///------------------------------------------------------------
 /// CPAP SD 卡匯入（資料夾模式）資料模型
 ///------------------------------------------------------------
@@ -208,7 +219,24 @@ class AppState extends ChangeNotifier {
     _loadPrefs();
   }
 
-  // Convenience accessor for legacy pages: AppState.of(context).
+  
+  // ---- Engine phase (scan -> compute -> done) ----
+  EnginePhase _enginePhase = EnginePhase.idle;
+  String _enginePhaseMessage = '';
+  DateTime? _enginePhaseSince;
+
+  EnginePhase get enginePhase => _enginePhase;
+  String get enginePhaseMessage => _enginePhaseMessage;
+  DateTime? get enginePhaseSince => _enginePhaseSince;
+
+  void setEnginePhase(EnginePhase phase, {String? message}) {
+    _enginePhase = phase;
+    if (message != null) _enginePhaseMessage = message;
+    _enginePhaseSince = DateTime.now();
+    notifyListeners();
+  }
+
+// Convenience accessor for legacy pages: AppState.of(context).
   // The state is provided by AppStateScope (InheritedNotifier).
   static AppState of(BuildContext context) => AppStateScope.of(context);
 

@@ -1,4 +1,5 @@
 // lib/home/home_page.dart
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
@@ -57,6 +58,32 @@ class _HomePageState extends State<HomePage> {
   // UI progress for the *scan/read* phase (mainly for Web folder picker).
   int _scanDone = 0;
   int _scanTotal = 0;
+
+  // Engine phase UX: show a clear hint when scan is done but the compute engine is running.
+  DateTime? _computingSince;
+  static const Duration _minComputingHint = Duration(milliseconds: 1200);
+
+  Future<void> _enterComputingPhase(AppState appState) async {
+    _computingSince = DateTime.now();
+    appState.setEnginePhase(
+      EnginePhase.computing,
+      message: '統計引擎運作中，請不要關閉本軟體',
+    );
+    // Yield one frame so the hint can paint before heavy synchronous work starts.
+    await Future<void>.delayed(const Duration(milliseconds: 40));
+  }
+
+  Future<void> _leaveComputingPhaseIfNeeded(AppState appState) async {
+    final since = _computingSince;
+    if (since == null) return;
+    final elapsed = DateTime.now().difference(since);
+    if (elapsed < _minComputingHint) {
+      await Future<void>.delayed(_minComputingHint - elapsed);
+    }
+    _computingSince = null;
+    // Caller will set next phase.
+  }
+
 
   @override
   void initState() {
@@ -118,6 +145,9 @@ class _HomePageState extends State<HomePage> {
       _scanTotal = 0;
     });
 
+    // Phase: scanning / reading files.
+    appStateStore.setEnginePhase(EnginePhase.scanning, message: '讀取資料中...');
+
     try {
       WebPickedFolderResult? picked;
       picked = await WebImport.pickFolderAndReadPrs1(
@@ -134,6 +164,7 @@ class _HomePageState extends State<HomePage> {
 
       if (!mounted) return;
       if (picked == null) {
+        appStateStore.setEnginePhase(EnginePhase.idle);
         setState(() {
           _busy = false;
           _status = '已取消資料夾選擇';
@@ -142,6 +173,9 @@ class _HomePageState extends State<HomePage> {
       }
 
       final pickedResult = picked;
+
+      // Scan/read progress is done. Switch to compute phase and show UX hint.
+      await _enterComputingPhase(appStateStore);
 
       setState(() {
         _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（PRS1檔案: ${pickedResult.prs1BytesByRelPath.length}）...';
@@ -176,14 +210,14 @@ class _HomePageState extends State<HomePage> {
       // Web「資訊流控制」：避免一次對整張 SD 進行全量 detail 建索引而卡死。
       // 解析 sessions（summary）仍保留全量；但 detail（indices/buckets）僅先建立「最近 N 天」，
       // 以支援儀表板與近期趨勢。需要全量時再另行觸發（後續會加按鈕/策略）。
-      const int _webDetailDays = 14;
+      const int _webDetailDays = 35; // allow week navigation up to ~1 month on Web
       final DateTime? newest = mergedSessions.isEmpty ? null : mergedSessions.first.start;
       final DateTime? cutoff =
           newest == null ? null : newest.subtract(const Duration(days: _webDetailDays));
 
       final List<Prs1Session> detailSessions = (cutoff == null)
           ? mergedSessions
-          : mergedSessions.where((s) => s.start.isAfter(cutoff)).toList();
+          : mergedSessions.where((s) => !s.start.isBefore(cutoff)).toList();
 
       if (!mounted) return;
       setState(() {
@@ -233,7 +267,10 @@ class _HomePageState extends State<HomePage> {
       );
 
 
+      await _leaveComputingPhaseIfNeeded(appStateStore);
+
       if (!mounted) return;
+      appStateStore.setEnginePhase(EnginePhase.done);
       setState(() {
         _busy = false;
         _status = '完成';
@@ -252,6 +289,7 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (!mounted) return;
+      appStateStore.setEnginePhase(EnginePhase.error, message: 'Web 匯入失敗：$e');
       setState(() {
         _busy = false;
         _status = 'Web 匯入失敗：$e';
@@ -274,12 +312,15 @@ class _HomePageState extends State<HomePage> {
       _prs1BlobCount = 0;
     });
 
+    appStateStore.setEnginePhase(EnginePhase.scanning, message: '掃描/讀取資料中...');
+
     final ok = await _folderService.request(_folderState);
     final folderPath = _folderState.folderPath;
 
     if (!mounted) return;
 
     if (!ok || folderPath == null || folderPath.isEmpty) {
+      appStateStore.setEnginePhase(EnginePhase.idle);
       setState(() {
         _busy = false;
         _status = '已取消或未授權資料夾';
@@ -328,6 +369,8 @@ class _HomePageState extends State<HomePage> {
         _prs1BlobCount = prs1Bytes.length;
         _status = '開始解析（PRS1檔案: ${prs1Bytes.length}）...';
       });
+
+      await _enterComputingPhase(appStateStore);
 
       // 解析：把每個 blob 丟進 loader，收集 session
       final loader = Prs1Loader();
@@ -398,7 +441,10 @@ class _HomePageState extends State<HomePage> {
       );
 
 
+      await _leaveComputingPhaseIfNeeded(appStateStore);
+
       if (!mounted) return;
+      appStateStore.setEnginePhase(EnginePhase.done);
       setState(() {
         _busy = false;
         _status = '完成';
@@ -417,6 +463,7 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (!mounted) return;
+      appStateStore.setEnginePhase(EnginePhase.error, message: '發生錯誤：$e');
       setState(() {
         _busy = false;
         _status = '發生錯誤：$e';
@@ -618,8 +665,31 @@ class _HomePageState extends State<HomePage> {
                               const SizedBox(height: 6),
                               Text('資料夾：${snap.folderPath}', style: theme.textTheme.bodySmall),
                             ],
+                            const SizedBox(height: 10),
+
                           ],
                         ),
+                      ),
+
+                      const SizedBox(height: 18),
+                      Expanded(
+                        child: Builder(builder: (context) {
+                          final bool showScanProgress = _scanTotal > 0;
+                          final double? progressValue = showScanProgress ? (_scanDone / _scanTotal) : null;
+                          final bool showComputingHint =
+                              (appState.enginePhase == EnginePhase.computing) &&
+                              (!showScanProgress || (progressValue != null && progressValue >= 1.0));
+                          if (!showComputingHint) return const SizedBox.shrink();
+                          final msg = (appState.enginePhaseMessage.isNotEmpty)
+                              ? appState.enginePhaseMessage
+                              : '統計引擎運作中，請不要關閉本軟體';
+                          return Center(
+                            child: _SoftBlinkingHintText(
+                              key: const ValueKey('engine_hint_blink_center'),
+                              text: msg,
+                            ),
+                          );
+                        }),
                       ),
 
                       
@@ -637,6 +707,10 @@ class _HomePageState extends State<HomePage> {
       ),
     );
   }
+
+
+
+
 
   /// Merge per-file partial PRS1 sessions into a single session keyed by session id.
   ///
@@ -679,6 +753,7 @@ class _HomePageState extends State<HomePage> {
 
       final mergedEvents = <Prs1Event>[...prev.events, ...s.events];
       final mergedPressureSamples = <Prs1SignalSample>[...prev.pressureSamples, ...s.pressureSamples];
+      final mergedExhalePressureSamples = <Prs1SignalSample>[...prev.exhalePressureSamples, ...s.exhalePressureSamples];
       final mergedLeakSamples = <Prs1SignalSample>[...prev.leakSamples, ...s.leakSamples];
       final mergedFlowSamples = <Prs1SignalSample>[...prev.flowSamples, ...s.flowSamples];
       final mergedFlexSamples = <Prs1SignalSample>[...prev.flexSamples, ...s.flexSamples];
@@ -713,6 +788,7 @@ class _HomePageState extends State<HomePage> {
         events: mergedEvents,
         minutesUsed: mergedMinutesUsed,
         pressureSamples: mergedPressureSamples,
+        exhalePressureSamples: mergedExhalePressureSamples,
         leakSamples: mergedLeakSamples,
         flowSamples: mergedFlowSamples,
         flexSamples: mergedFlexSamples,
@@ -724,5 +800,60 @@ class _HomePageState extends State<HomePage> {
     }
 
     return <Prs1Session>[...byKey.values, ...passthrough];
+  }
+}
+
+class _SoftBlinkingHintText extends StatefulWidget {
+  const _SoftBlinkingHintText({
+    super.key,
+    required this.text,
+  });
+
+  final String text;
+
+  @override
+  State<_SoftBlinkingHintText> createState() => _SoftBlinkingHintTextState();
+}
+
+class _SoftBlinkingHintTextState extends State<_SoftBlinkingHintText> {
+  static const Duration _tick = Duration(milliseconds: 950);
+  static const Duration _anim = Duration(milliseconds: 520);
+
+  Timer? _timer;
+  bool _on = true;
+
+  @override
+  void initState() {
+    super.initState();
+    // Timer-driven blinking: does not depend on TickerProvider and is resilient to frequent rebuilds.
+    _timer = Timer.periodic(_tick, (_) {
+      if (!mounted) return;
+      setState(() => _on = !_on);
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AnimatedOpacity(
+      opacity: _on ? 1.0 : 0.18,
+      duration: _anim,
+      curve: Curves.easeInOut,
+      child: Text(
+        widget.text,
+        textAlign: TextAlign.center,
+        style: (theme.textTheme.titleMedium ?? theme.textTheme.titleSmall)?.copyWith(
+          fontSize: 18,
+          fontWeight: FontWeight.w800,
+          color: Colors.black,
+        ),
+      ),
+    );
   }
 }

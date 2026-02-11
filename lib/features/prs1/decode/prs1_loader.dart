@@ -14,6 +14,11 @@ import 'frame_decoder.dart';
 import 'event_decoder.dart';
 import 'session_stats.dart';
 
+// === PRS1 debug logging toggle ===
+// Set to true only when you need to inspect decode internals.
+const bool kPrs1CliVerbose = false;
+
+
 /// Core decoder scaffold that will be progressively filled to match OSCAR's prs1_loader.cpp.
 ///
 /// Current stage:
@@ -161,6 +166,8 @@ class _ChunkSummary {
   // Low-rate signal samples (typically per-minute) extracted from event chunks (.002).
   // These feed the daily aggregator percentile metrics (Leak p95 / Pressure p95).
   final List<Prs1SignalSample> pressureSamples = <Prs1SignalSample>[];
+  // Separate exhale/Flex-affected pressure line (OSCAR green line).
+  final List<Prs1SignalSample> exhalePressureSamples = <Prs1SignalSample>[];
   final List<Prs1SignalSample> leakSamples = <Prs1SignalSample>[];
   final List<Prs1SignalSample> flowLimSamples = <Prs1SignalSample>[];
 
@@ -177,6 +184,12 @@ class _ChunkSummary {
   /// Discrete events (OA/CA/H/FL/snore/etc) extracted from event chunks (.002).
   /// These feed daily AHI and FL summaries.
   final List<Prs1Event> events = <Prs1Event>[];
+
+  // ---- Debug counters (for FlexPressureAverage / EPAP green line) ----
+  int stats11Count = 0; // how many 0x11 Statistics records were parsed
+  int epapSampleCount = 0; // how many FlexPressureAverage samples were emitted
+  int? unknownEventCode; // first unknown event code that caused an early break
+  final Set<int> stats11Sizes = <int>{}; // observed hblock size for 0x11
 
   void addSlice(DateTime s, Duration d) {
     start = (start == null || s.isBefore(start!)) ? s : start;
@@ -360,8 +373,31 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
             if (p >= pos + blockSize) break;
             final code = bytes[p++];
             if (!hblock.containsKey(code)) {
-              // Unknown event code; stop to avoid desync.
-              break;
+              // Unknown event code.
+              //
+              // In the field we sometimes see short corrupt spans (or we mis-read
+              // the delta-prefix rule for a device variant). Hard-breaking here
+              // causes us to lose downstream 0x11 Statistics records, which are
+              // the only reliable source for Flex/EPAP (OSCAR green line).
+              //
+              // Strategy:
+              // - Record the first unknown code for debugging.
+              // - Try to resync by scanning ahead for the next byte that is a
+              //   known event code (present in hblock). If found, jump there and
+              //   continue. Otherwise, stop.
+              summary.unknownEventCode ??= code;
+              int? next;
+              final scanLimit = (pos + blockSize).clamp(0, bytes.length);
+              for (int r = p; r < scanLimit && r < p + 24; r++) {
+                final c = bytes[r];
+                if (hblock.containsKey(c)) {
+                  next = r;
+                  break;
+                }
+              }
+              if (next == null) break;
+              p = next;
+              continue;
             }
             final size = hblock[code]!;
             // Ensure payload within chunk.
@@ -440,6 +476,19 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
                   sourceOffset: p,
                 ),
               );
+            } else if ((code == 0x14 || code == 0x15) && size >= 3) {
+              // Hypopnea variants seen in OSCAR PRS1 parser (family 0 / v6)
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.hypopnea,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
             } else if (code == 0x0C && size >= 3) {
               final elapsedSec = bytes[p + 0];
               final eTime = clampEpoch(tEpoch - elapsedSec);
@@ -452,19 +501,194 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
                   sourceOffset: p,
                 ),
               );
+            } else if (code == 0x04 && size >= 3) {
+              // Pressure change marker (keep legacy mapping here; we also map 0x12 to pressurePulse)
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.pressureChange,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x05 && size >= 3) {
+              // RERA (RE) - OSCAR: PRS1RERAEvent
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.rera,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0D && size >= 3) {
+              // Vibratory Snore (VS) - OSCAR: PRS1VibratorySnoreEvent
+              final intensity = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.vibratorySnore,
+                  value: intensity.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x11 && size == 3) {
+              // VS2 fallback (rare): some devices may store a snore-like marker under 0x11
+              // with only a 1-byte payload. For DreamStation F0V6, however, the *Statistics*
+              // record is also 0x11 but has size==5 (dt+3 bytes). We must not interpret
+              // that stats record as VS2.
+              final intensity = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.vibratorySnore2,
+                  value: intensity.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x12 && size >= 3) {
+              // Pressure Pulse (PP) - OSCAR: PRS1PressurePulseEvent
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.pressurePulse,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0E && size >= 3) {
+              // Variable Breathing (VB)
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.variableBreathing,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x0F && size >= 3) {
+              // Periodic Breathing (PB)
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.periodicBreathing,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+            } else if (code == 0x10 && size >= 3) {
+              // Large Leak (LL)
+              final elapsedSec = bytes[p + 0];
+              final eTime = clampEpoch(tEpoch - elapsedSec);
+              summary.events.add(
+                Prs1Event(
+                  time: atEpoch(eTime),
+                  type: Prs1EventType.largeLeak,
+                  value: elapsedSec.toDouble(),
+                  code: code,
+                  sourceOffset: p,
+                ),
+              );
+
+            }
+
+            // Pressure setting adjustment (OSCAR: PRS1PressureSetEvent) in F0V6.
+            //
+            // In OSCAR's xpap parser this is event code 0x02 ("Pressure adjustment")
+            // and the payload byte is in 0.1 cmH2O.
+            if (code == 0x01 && size >= 3) {
+              // DreamStation (family 0 v6) "Pressure adjustment" (single pressure).
+              // OSCAR: ParseEventsF0V6 -> case 0x01 -> PRS1PressureSetEvent(t, data[pos])
+              final pressure = bytes[p + 0] / 10.0;
+              summary.pressureSamples.add(
+                Prs1SignalSample(
+                  tEpochSec: tEpoch,
+                  value: pressure,
+                  signalType: Prs1SignalType.pressure,
+                ),
+              );
+            } else if (code == 0x02 && size >= 4) {
+              // DreamStation (family 0 v6) "Pressure adjustment" (bi-level).
+              // Payload: [EPAP, IPAP] in 0.1 cmH2O. The OSCAR red line corresponds to IPAP/setpoint.
+              final ipap = bytes[p + 1] / 10.0;
+              summary.pressureSamples.add(
+                Prs1SignalSample(
+                  tEpochSec: tEpoch,
+                  value: ipap,
+                  signalType: Prs1SignalType.pressure,
+                ),
+              );
             }
 
             // Stats record (code 0x11): contains total leak + flex pressure average.
-            // OSCAR: TotalLeakEvent(t, data[pos]); FlexPressureAverageEvent(t, data[pos+2]).
-            // For V6, stats record payload is at least 3 bytes (leak, snore, flexPressureAvg),
-            // and the record includes a 2-byte delta prefix => size >= 5.
-            if (code == 0x11 && size >= 5) {
-              final leak = bytes[p + 0].toDouble();
-              final flexPressureTenth = bytes[p + 2];
-              final pressure = flexPressureTenth / 10.0;
+            // OSCAR (DreamStation / PRS1 v6):
+            //   - TotalLeakEvent(t, data[pos])
+            //   - FlexPressureAverageEvent(t, data[pos+2])
+            //
+            // In the wild, we have seen variants where the flex byte shifts (pos+1) or
+            // is encoded with extra padding. We therefore decode defensively:
+            //   1) Prefer payload[2] (OSCAR)
+            //   2) Otherwise scan payload[1..] for the first value that looks like a
+            //      pressure in 0.1 cmH2O within a sane range (4.0..25.0 => 40..250)
+            //   3) Fallback to payload[1]
+            if (code == 0x11) {
+              summary.stats11Count += 1;
+              summary.stats11Sizes.add(size);
+              final payloadLen = (payloadStart + size) - p;
+              if (payloadLen >= 2) {
+                final leak = bytes[p + 0].toDouble();
 
-              summary.leakSamples.add(Prs1SignalSample(tEpochSec: tEpoch, value: leak, signalType: Prs1SignalType.leak));
-              summary.pressureSamples.add(Prs1SignalSample(tEpochSec: tEpoch, value: pressure, signalType: Prs1SignalType.pressure));
+                int pickFlexTenth() {
+                  // 1) OSCAR expected position.
+                  if (payloadLen >= 3) {
+                    final v = bytes[p + 2];
+                    if (v >= 40 && v <= 250) return v;
+                  }
+                  // 2) Scan remaining bytes for plausible 0.1 cmH2O pressure.
+                  final scanStart = (payloadLen >= 3) ? 1 : 1;
+                  for (int i = scanStart; i < payloadLen; i++) {
+                    final v = bytes[p + i];
+                    if (v >= 40 && v <= 250) return v;
+                  }
+                  // 3) Fallback.
+                  return bytes[p + 1];
+                }
+
+                final flexTenth = pickFlexTenth();
+                final flexPressureAvg = flexTenth / 10.0;
+
+                summary.leakSamples.add(
+                  Prs1SignalSample(tEpochSec: tEpoch, value: leak, signalType: Prs1SignalType.leak),
+                );
+                // Keep flex-pressure series separate from therapy setpoint (pressureSamples).
+                summary.exhalePressureSamples.add(
+                  Prs1SignalSample(tEpochSec: tEpoch, value: flexPressureAvg, signalType: Prs1SignalType.exhalePressure),
+                );
+
+                // Count only plausible samples.
+                if (flexTenth >= 40 && flexTenth <= 250) {
+                  summary.epapSampleCount += 1;
+                }
+              }
             }
 
             // Advance to next event start. The hblock size already includes the delta prefix.
@@ -473,9 +697,27 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
 
           // Keep deterministic ordering.
           summary.pressureSamples.sort((a, b) => a.tEpochSec.compareTo(b.tEpochSec));
+          summary.exhalePressureSamples.sort((a, b) => a.tEpochSec.compareTo(b.tEpochSec));
           summary.leakSamples.sort((a, b) => a.tEpochSec.compareTo(b.tEpochSec));
           summary.events.sort((a, b) => a.time.compareTo(b.time));
+
+          // ---- Debug output: prove whether we ever scanned 0x11 Statistics and extracted EPAP samples ----
+          // This is intentionally loud in debug runs; it helps us decide whether the problem is:
+          //   A) never reached 0x11, B) reached 0x11 but failed to pick flex byte, or C) downstream wiring.
+          final probeLine = () {
+            final sizes = (summary.stats11Sizes.toList()..sort());
+            final epapHead = summary.exhalePressureSamples.take(3).map((e) => e.value.toStringAsFixed(1)).join(',');
+            return 'PRS1[session=${summary.sessionId}] 0x11_stats=${summary.stats11Count} epap_samples=${summary.epapSampleCount} sizes=$sizes epap_head=[$epapHead] unknown=${summary.unknownEventCode == null ? "-" : "0x${summary.unknownEventCode!.toRadixString(16)}"}';
+          }();
+
+          // IMPORTANT: Web builds often don't show debug-level logs.
+          // We intentionally emit this as INFO and also print() so it's visible in Chrome console.
+          if (kPrs1CliVerbose) {
+          Log.i(probeLine, tag: 'PRS1');
+          // ignore: avoid_print
+          print(probeLine);
         }
+}
       }
     }
 
@@ -550,23 +792,32 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
       s.minPressureSettingCmH2O = sorted[sorted.length ~/ 2];
     }
 
-    final epapMin = (s.pressureSamples.isEmpty)
+    // If we already decoded explicit pressure-setting events (0x02), use that
+    // series as the therapy setpoint.
+    final hasSetpointSeries = s.pressureSamples.isNotEmpty;
+
+    // Otherwise we can only derive an EPAP/Flex-affected pressure average from
+    // Stats 0x11; in that case we keep it as exhalePressureSamples and
+    // (temporarily) normalize it to approximate OSCAR's therapy pressure stats.
+    final epapMin = (s.exhalePressureSamples.isEmpty)
         ? null
-        : (s.pressureSamples.map((e) => e.value).reduce((a, b) => a < b ? a : b));
+        : (s.exhalePressureSamples.map((e) => e.value).reduce((a, b) => a < b ? a : b));
 
     final baseline = (s.minPressureSettingCmH2O != null)
         ? s.minPressureSettingCmH2O!
         : ((epapMin != null) ? ((epapMin + 2.0) * 2).round() / 2.0 : null);
 
-    final calibratedPressureSamples = (baseline != null && epapMin != null)
-        ? s.pressureSamples
+    final derivedSetpointSamples = (!hasSetpointSeries && baseline != null && epapMin != null)
+        ? s.exhalePressureSamples
             .map((e) => Prs1SignalSample(
                   tEpochSec: e.tEpochSec,
                   value: e.value + (baseline - epapMin),
-                  signalType: e.signalType,
+                  signalType: Prs1SignalType.pressure,
                 ))
             .toList(growable: false)
-        : s.pressureSamples;
+        : const <Prs1SignalSample>[];
+
+    final therapyPressureSamples = hasSetpointSeries ? s.pressureSamples : derivedSetpointSamples;
     // -----------------------------------------------------------------------------
 
     
@@ -585,7 +836,8 @@ sessions.add(
         start: start,
         end: (s.usageSeconds > 0) ? start.add(Duration(seconds: s.usageSeconds)) : end,
         events: List.unmodifiable(s.events),
-        pressureSamples: calibratedPressureSamples,
+        pressureSamples: therapyPressureSamples,
+        exhalePressureSamples: List.unmodifiable(s.exhalePressureSamples),
         leakSamples: s.leakSamples,
         flowWaveform: flowWf,
         sourcePath: sourcePath,

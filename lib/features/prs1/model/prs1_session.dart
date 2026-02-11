@@ -11,6 +11,7 @@ class Prs1Session {
     required this.end,
     required this.events,
     this.pressureSamples = const [],
+    this.exhalePressureSamples = const [],
     this.leakSamples = const [],
     this.flowSamples = const [],
     this.flexSamples = const [],
@@ -35,6 +36,16 @@ class Prs1Session {
   /// Continuous signal samples (Milestone A / L8). These may be empty until the
   /// decoder layer is extended to extract time-series channels.
   final List<Prs1SignalSample> pressureSamples;
+
+  /// Exhale-pressure related series (e.g., Flex pressure average).
+  ///
+  /// OSCAR's Pressure chart typically shows two lines:
+  /// - Pressure Setting (therapy setpoint / AutoCPAP target)
+  /// - Exhale pressure (Flex/EPAP-like)
+  ///
+  /// We keep the second line separate so it won't pollute therapy-pressure
+  /// percentiles and summary stats.
+  final List<Prs1SignalSample> exhalePressureSamples;
   final List<Prs1SignalSample> leakSamples;
   final List<Prs1SignalSample> flowSamples;
 

@@ -35,7 +35,11 @@ class Prs1DailyBucket {
     required this.slices,
     required this.events,
     required this.pressureSamples,
+    required this.exhalePressureSamples,
     required this.leakSamples,
+    required this.unintentionalLeakSamples,
+    required this.leakBaselineLpm,
+    required this.largeLeakThresholdLpm,
     required this.flowSamples,
     required this.flexSamples,
     required this.usageSeconds,
@@ -48,6 +52,10 @@ class Prs1DailyBucket {
     required this.pressureMedian,
     required this.pressureP95,
     required this.pressureMax,
+    required this.epapMin,
+    required this.epapMedian,
+    required this.epapP95,
+    required this.epapMax,
     this.pressureOscarMin,
     this.pressureOscarMedian,
     this.pressureOscarP95,
@@ -133,7 +141,21 @@ class Prs1DailyBucket {
   /// These lists are *engine channels*: they may be empty until decoders start
   /// extracting time-series signals from PRS1.
   final List<Prs1SignalSample> pressureSamples;
+  /// Flex / EPAP-like pressure samples (OSCAR green line).
+  final List<Prs1SignalSample> exhalePressureSamples;
   final List<Prs1SignalSample> leakSamples;
+
+  /// Unintentional leak (L/min), derived from [leakSamples] minus
+  /// [leakBaselineLpm]. This is what OSCAR typically charts as a separate
+  /// (lower) series.
+  final List<Prs1SignalSample> unintentionalLeakSamples;
+
+  /// Estimated baseline/intentional leak (L/min) for this bucket.
+  final double? leakBaselineLpm;
+
+  /// Large leak threshold (L/min). Used by UI to draw a dashed reference line.
+  final double largeLeakThresholdLpm;
+
   final List<Prs1SignalSample> flowSamples;
   final List<Prs1SignalSample> flexSamples;
 
@@ -161,6 +183,12 @@ class Prs1DailyBucket {
   final double? pressureMedian;
   final double? pressureP95;
   final double? pressureMax;
+
+  /// EPAP-like (FlexPressureAverage) stats (cmH2O).
+  final double? epapMin;
+  final double? epapMedian;
+  final double? epapP95;
+  final double? epapMax;
 
 
   // OSCAR reference for pressure (optional).

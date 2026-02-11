@@ -1,10 +1,31 @@
 import 'dart:math' as math;
-
 import 'package:flutter/material.dart';
-
 import '../app_state.dart';
 import '../features/prs1/aggregate/prs1_daily_models.dart';
+import '../features/prs1/model/prs1_waveform_channel.dart';
 import '../features/prs1/stats/prs1_rolling_metrics.dart';
+import 'charts/prs1_chart_events.dart';
+import 'charts/prs1_chart_flow_rate.dart';
+import 'charts/prs1_chart_pressure.dart';
+import 'charts/prs1_chart_leak_rate.dart';
+import 'package:tophome/features/prs1/derive/prs1_event_deriver.dart';
+
+// --- Brand color helpers (keep Layer-3 colors synced with selected BrandColor) ---
+Color _deepen(Color c, {required Brightness brightness, double amountLight = 0.60, double amountDark = 0.25}) {
+  // Blend towards black to get a stable "accent" that still tracks BrandColor.
+  final t = brightness == Brightness.dark ? amountDark : amountLight;
+  return Color.lerp(c, Colors.black, t)!;
+}
+
+Color _soften(Color c, Color toward, {double t = 0.65}) {
+  return Color.lerp(c, toward, t)!;
+}
+
+Color _readableOn(Color bg) {
+  // Simple luminance-based contrast choice.
+  return bg.computeLuminance() > 0.55 ? Colors.black : Colors.white;
+}
+
 
 /// 單列統計資料（對齊 OSCAR：最小 / 中間值 / 95% / 最大）
 class _StatRow {
@@ -32,14 +53,17 @@ class _AhiBanner extends StatelessWidget {
   final double? ahi;
 
   @override
+
+@override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final v = ahi;
     final text = v == null ? '—' : v.toStringAsFixed(2);
 
-    // 用品牌色的深色調，維持你偏好的沉穩酒紅感。
-    final bg = const Color(0xFF7A3E54);
-    final fg = theme.colorScheme.onPrimary;
+    final appState = AppStateScope.of(context);
+    final cs = theme.colorScheme;
+    final bg = _deepen(appState.brandColor.color, brightness: cs.brightness);
+    final fg = _readableOn(bg);
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
@@ -77,7 +101,33 @@ class Prs1DashboardPage extends StatefulWidget {
 }
 
 class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
-  int _selectedIndex = 0; // 0 = 最早；會在 build 時矯正到最後一天
+  int _weekOffset = 0; // 0 = latest week, -1 = previous week ...
+  void _prevWeek(int maxBackWeeks) {
+    if (_weekOffset > -maxBackWeeks) {
+      setState(() {
+        _weekOffset -= 1;
+        _selectedIndex = 0;
+        _didInitSelection = false;
+      });
+    }
+  }
+
+  void _nextWeek() {
+    if (_weekOffset < 0) {
+      setState(() {
+        _weekOffset += 1;
+        _selectedIndex = 0;
+        _didInitSelection = false;
+      });
+    }
+  }
+
+  final ScrollController _rightChartsCtrl = ScrollController();
+
+  ColorScheme get scheme => Theme.of(context).colorScheme;
+
+  int _selectedIndex = 0; // index into last7
+  bool _didInitSelection = false;
 
   @override
   Widget build(BuildContext context) {
@@ -85,7 +135,14 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
     final buckets = List<Prs1DailyBucket>.from(store.prs1DailyBuckets);
     buckets.sort((a, b) => a.day.compareTo(b.day));
 
-    final last7 = _buildLast7Days(buckets);
+    final maxBackWeeks = math.min(4, (buckets.length - 1) ~/ 7);
+    // clamp _weekOffset so it never exceeds available data window
+    if (_weekOffset < -maxBackWeeks) {
+      _weekOffset = -maxBackWeeks;
+      _selectedIndex = 0;
+      _didInitSelection = false;
+    }
+    final last7 = _buildWeekWindow(buckets, _weekOffset);
     if (last7.isEmpty) {
       return Scaffold(
         appBar: AppBar(title: const Text('我的本周睡眠呼吸紀錄')),
@@ -93,19 +150,38 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
       );
     }
 
-    // 預設選最後一天
-    _selectedIndex = _selectedIndex.clamp(0, last7.length - 1);
-    if (_selectedIndex == 0) {
-      // 只有第一次進來或狀態重置時，指向最新一天
+    // 預設選最後一天（僅第一次進入頁面時）
+    if (!_didInitSelection) {
       _selectedIndex = last7.length - 1;
+      _didInitSelection = true;
     }
-
+    _selectedIndex = _selectedIndex.clamp(0, last7.length - 1).toInt();
     final b = last7[_selectedIndex];
     final ymdLabel = _formatDateToChinese(b.day);
+
+    // Session time window (align with OSCAR header: start/end/usage)
+    final DateTime? sessionStart = b.slices.isEmpty
+        ? null
+        : b.slices.map((s) => s.session.start).reduce((a, c) => a.isBefore(c) ? a : c);
+
+    final DateTime? sessionEnd = b.slices.isEmpty
+        ? null
+        : b.slices.map((s) => s.session.end).reduce((a, c) => a.isAfter(c) ? a : c);
+
+    // Sessions list for waveform index (FlowRate chart stitches segments via index)
+    final sessions = b.slices.map((s) => s.session).toList();
+
+final startLabel = sessionStart == null ? '—' : _formatHm(sessionStart);
+final endLabel = sessionEnd == null ? '—' : _formatHm(sessionEnd);
+final usageLabel = _formatDurationHm(Duration(seconds: b.usageSeconds));
 
     // AHI：使用「整晚平均」(OA + CA + H) / 小時，與 OSCAR 的 Daily AHI 對齊。
     // 注意：rollingAhi5m/30m 的最大值可能會「爆表」，不適合作為給一般用戶看的核心數字。
     final double? nightlyAhi = b.ahi;
+
+// AHI 統計列：用較穩定的 rollingAhi30m 來取 min/median/p95/max（避免 5m 視窗爆表）。
+final ahiSeries = b.rollingAhi30m.map((e) => e.value).whereType<double>().toList();
+final ahiStats = _statsOfValues(ahiSeries.isEmpty ? <double>[] : ahiSeries);
 
     // 這個欄位在模型中允許為 null；null 就讓 UI 顯示「—」。
     final double? leakOverPct = (b.leakPercentOverThreshold == null)
@@ -114,6 +190,7 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
 
     final rows = <_StatRow>[
       _StatRow('陽壓治療壓力值', unit: 'cmH₂O', min: b.pressureMin, median: b.pressureMedian, p95: b.pressureP95, max: b.pressureMax),
+      _StatRow('吐氣壓力 (EPAP)', unit: 'cmH₂O', min: b.epapMin, median: b.epapMedian, p95: b.epapP95, max: b.epapMax),
       if (b.pressureOscarMin != null)
         _StatRow('陽壓治療壓力值 (OSCAR)', unit: 'cmH₂O', min: b.pressureOscarMin, median: b.pressureOscarMedian, p95: b.pressureOscarP95, max: b.pressureOscarMax),
       if (b.pressureBiasPctMin != null)
@@ -126,14 +203,14 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
       _StatRow('I:E 比', unit: '', min: b.ieRatioMin, median: b.ieRatioMedian, p95: b.ieRatioP95, max: b.ieRatioMax),
       _StatRow('面罩漏氣率', unit: 'L/min', min: b.leakMin, median: b.leakMedian, p95: b.leakP95, max: b.leakMax),
       _StatRow('漏氣超過閾值的比例', unit: '%', min: leakOverPct, median: leakOverPct, p95: leakOverPct, max: leakOverPct),
-      _StatRow('呼吸中止指數 (AHI)', unit: '', min: nightlyAhi, median: nightlyAhi, p95: nightlyAhi, max: nightlyAhi),
+      _StatRow('呼吸中止指數 (AHI)', unit: '', min: ahiStats.min, median: nightlyAhi ?? ahiStats.median, p95: ahiStats.p95, max: ahiStats.max),
       _StatRow('氣流受限值', unit: '', min: b.flowLimitationMin, median: b.flowLimitationMedian, p95: b.flowLimitationP95, max: b.flowLimitationMax),
     ];
 
     return Scaffold(
-      backgroundColor: const Color(0xFFFFF6F7),
+      backgroundColor: Theme.of(context).colorScheme.surface,
       appBar: AppBar(
-        backgroundColor: const Color(0xFFFFF6F7),
+        backgroundColor: Theme.of(context).colorScheme.surface,
         elevation: 0,
         leading: IconButton(
           icon: const Icon(Icons.arrow_back),
@@ -143,64 +220,193 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
         title: const Text('我的本周睡眠呼吸紀錄'),
       ),
       body: SafeArea(
-        child: Padding(
-          padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // 上方柱狀圖固定，不跟著下方統計表一起滾動。
-              _WeekCard(
-                buckets: last7,
-                selectedIndex: _selectedIndex,
-                onSelect: (i) => setState(() => _selectedIndex = i),
-              ),
-              const SizedBox(height: 14),
-              // 一般用戶最直覺關心的核心指標：整晚 AHI（與 OSCAR 對齊）。
-              _AhiBanner(ahi: nightlyAhi),
-              const SizedBox(height: 14),
-              // 下方統計資料框獨立滾動（並凍結欄位標題列）。
-              Expanded(
-                child: _StatsPanel(
-                  dateLabel: ymdLabel,
-                  rows: rows,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            // iPad / 橫向：左右並排（右側寬度 = 左側的 300% ≈ 放大 200%）
+            final isWide = constraints.maxWidth >= 820;
+
+            // 統計區（左欄）不要再縮小：避免 iPad/桌面下可讀性崩壞。
+            const double minLeftWidth = 430;
+
+            // 右側圖表欄最大只到「放大 200%」(也就是右=左*2)。
+            // 超過的寬度不再繼續擴張，維持在合理閱讀範圍內。
+
+            final leftPanel = ConstrainedBox(
+              constraints: const BoxConstraints(minWidth: minLeftWidth),
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 上方柱狀圖固定，不跟著下方統計表一起滾動。
+                    _WeekCard(
+                      buckets: last7,
+                      selectedIndex: _selectedIndex,
+                      onSelect: (i) => setState(() => _selectedIndex = i),
+                      weekOffset: _weekOffset,
+                      onPrevWeek: (_weekOffset > -maxBackWeeks) ? () => _prevWeek(maxBackWeeks) : null,
+                      onNextWeek: (_weekOffset < 0) ? _nextWeek : null,
+                    ),
+                    const SizedBox(height: 14),
+                    // 一般用戶最直覺關心的核心指標：整晚 AHI（與 OSCAR 對齊）。
+                    _AhiBanner(ahi: nightlyAhi),
+                    const SizedBox(height: 14),
+                    // 下方統計資料框獨立滾動（並凍結欄位標題列）。
+                    Expanded(
+                      child: _StatsPanel(
+                        dateLabel: ymdLabel,
+                        startLabel: startLabel,
+                        endLabel: endLabel,
+                        usageLabel: usageLabel,
+                        rows: rows,
+                      ),
+                    ),
+                  ],
                 ),
               ),
-            ],
-          ),
+            );
+
+            // 右側圖表（目前只先接第一張：事件標記）
+            final rightPanelWithCharts = Padding(
+              padding: const EdgeInsets.fromLTRB(0, 16, 16, 16),
+              child: Scrollbar(
+                controller: _rightChartsCtrl,
+                thumbVisibility: true,
+                child: ListView(
+                  controller: _rightChartsCtrl,
+                  children: [
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartEvents(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        events: Prs1EventDeriver.derive(decodedEvents: b.events),
+                      )
+                    else
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: scheme.surfaceContainerHighest.withOpacity(0.35),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: scheme.outlineVariant),
+                        ),
+                        child: Text(
+                          '事件標記：本日資料缺少 session 起訖時間（尚未建立 slices / session window）',
+                          style: TextStyle(
+                            color: scheme.onSurface.withOpacity(0.75),
+                            fontSize: 13,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                      ),
+                    const SizedBox(height: 12),
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartFlowRate(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        sessions: sessions,
+                      ),
+                    const SizedBox(height: 12),
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartPressure(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        sessions: sessions,
+                      ),
+                    const SizedBox(height: 12),
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartLeakRate(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        bucket: b,
+                      ),
+                  ],
+                ),
+              ),
+            );
+
+            if (isWide) {
+              final totalW = constraints.maxWidth;
+
+              // 先保住左欄最小寬度；剩餘寬度給右欄，但右欄最多 = 左欄 * 2（200%）。
+              final leftW = math.min(
+                math.max(minLeftWidth, totalW / 3.0),
+                totalW,
+              );
+              final rightW = math.min(
+                math.max(0.0, totalW - leftW),
+                leftW * 2.0,
+              );
+              final unused = math.max(0.0, totalW - leftW - rightW);
+
+              return Row(
+                children: [
+                  SizedBox(width: leftW, child: leftPanel),
+                  SizedBox(width: rightW, child: rightPanelWithCharts),
+                  if (unused > 0) SizedBox(width: unused),
+                ],
+              );
+            }
+
+            // iPhone / 窄螢幕：用左右滑的方式（左：統計；右：圖表）
+return PageView(
+              children: [
+                leftPanel,
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                  child: rightPanelWithCharts,
+                ),
+              ],
+            );
+          },
         ),
       ),
     );
   }
 
-  static List<Prs1DailyBucket> _buildLast7Days(List<Prs1DailyBucket> sorted) {
+  static List<Prs1DailyBucket> _buildWeekWindow(List<Prs1DailyBucket> sorted, int weekOffset) {
     if (sorted.isEmpty) return const [];
-    final start = math.max(0, sorted.length - 7);
-    return sorted.sublist(start);
+    // weekOffset: 0 = latest week, -1 = previous week, etc.
+    final endExclusive = sorted.length + (weekOffset * 7);
+    final clampedEnd = math.min(sorted.length, math.max(0, endExclusive));
+    final start = math.max(0, clampedEnd - 7);
+    if (start >= clampedEnd) return const [];
+    return sorted.sublist(start, clampedEnd);
   }
 }
+
 
 class _WeekCard extends StatelessWidget {
   final List<Prs1DailyBucket> buckets;
   final int selectedIndex;
   final ValueChanged<int> onSelect;
+  final int weekOffset;
+  final VoidCallback? onPrevWeek;
+  final VoidCallback? onNextWeek;
 
   const _WeekCard({
     required this.buckets,
     required this.selectedIndex,
     required this.onSelect,
+    required this.weekOffset,
+    this.onPrevWeek,
+    this.onNextWeek,
   });
 
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final appState = AppStateScope.of(context);
+    final accent = _deepen(appState.brandColor.color, brightness: theme.colorScheme.brightness);
     final maxUsage = buckets.map((e) => e.usageSeconds).fold<int>(0, (p, c) => math.max(p, c));
     final cardBorder = BorderRadius.circular(16);
 
     return Container(
       padding: const EdgeInsets.fromLTRB(14, 16, 14, 12),
       decoration: BoxDecoration(
-        color: const Color(0xFFFFFBFB),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: cardBorder,
-        border: Border.all(color: const Color(0xFFDCC9CF)),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.6)),
       ),
       child: Column(
         children: [
@@ -224,9 +430,11 @@ class _WeekCard extends StatelessWidget {
                       AnimatedContainer(
                         duration: const Duration(milliseconds: 180),
                         height: h,
-                        width: 10,
+                        width: 15,
                         decoration: BoxDecoration(
-                          color: isSel ? const Color(0xFF7B3D59) : const Color(0xFFE8D7DE),
+                          color: isSel
+                                ? _deepen(AppStateScope.of(context).brandColor.color, brightness: Theme.of(context).colorScheme.brightness)
+                                : _soften(AppStateScope.of(context).brandColor.color, Theme.of(context).colorScheme.surface, t: 0.80),
                           // 細瘦長條柱狀圖（避免膠囊形狀）。
                           borderRadius: BorderRadius.circular(2),
                         ),
@@ -246,11 +454,37 @@ class _WeekCard extends StatelessWidget {
             }),
           ),
           const SizedBox(height: 10),
-          const Divider(height: 1, color: Color(0xFFDCC9CF)),
+          Divider(height: 1, color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.6)),
           const SizedBox(height: 10),
-          Text(
-            '睡眠區間：${_formatDateToChinese(buckets.first.day)} ~ ${_formatDateToChinese(buckets.last.day)}',
-            style: const TextStyle(fontSize: 13),
+          IconTheme(
+            data: IconThemeData(color: accent),
+            child: Row(
+              children: [
+              IconButton(
+                onPressed: onPrevWeek,
+                icon: const Icon(Icons.arrow_left, size: 34),
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 52, minHeight: 52),
+              ),
+              Expanded(
+                child: Center(
+                  child: Text(
+                    '睡眠區間：${_formatDateToChinese(buckets.first.day)} ~ ${_formatDateToChinese(buckets.last.day)}',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ),
+              ),
+              if (weekOffset < 0)
+                IconButton(
+                  onPressed: onNextWeek,
+                  icon: const Icon(Icons.arrow_right, size: 34),
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                )
+              else
+              const SizedBox(width: 52),
+            ],
+            ),
           ),
         ],
       ),
@@ -263,10 +497,16 @@ class _WeekCard extends StatelessWidget {
 /// - 欄位標題列凍結（類似 Excel 凍結視窗）
 class _StatsPanel extends StatelessWidget {
   final String dateLabel;
+  final String startLabel;
+  final String endLabel;
+  final String usageLabel;
   final List<_StatRow> rows;
 
   const _StatsPanel({
     required this.dateLabel,
+    required this.startLabel,
+    required this.endLabel,
+    required this.usageLabel,
     required this.rows,
   });
 
@@ -276,34 +516,52 @@ class _StatsPanel extends StatelessWidget {
 
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFFFFFBFB),
+        color: Theme.of(context).colorScheme.surface,
         borderRadius: cardBorder,
-        border: Border.all(color: const Color(0xFFDCC9CF)),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.6)),
       ),
       child: Column(
         children: [
           const SizedBox(height: 12),
           Row(
             mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Text('統計資料', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
-              const SizedBox(width: 10),
-              Text('本日：$dateLabel', style: const TextStyle(fontSize: 13)),
+            children: const [
+              Text('統計資料', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w700)),
             ],
           ),
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  '本日$dateLabel',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 13),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '開始：$startLabel  結束：$endLabel  使用時間：$usageLabel',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ],
+            ),
+          ),
           const SizedBox(height: 10),
-          const Divider(height: 1, color: Color(0xFFDCC9CF)),
+          Divider(height: 1, color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.6)),
           _FrozenHeaderRow(),
-          const Divider(height: 1, color: Color(0xFFDCC9CF)),
+          Divider(height: 1, color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.6)),
           // 僅表格內容可滾動
           Expanded(
             child: ListView.separated(
               padding: const EdgeInsets.fromLTRB(12, 6, 12, 10),
               itemCount: rows.length,
-              separatorBuilder: (_, __) => const Divider(height: 1, color: Color(0xFFE6D6DB)),
+              separatorBuilder: (_, __) => Divider(height: 1, color: Theme.of(context).colorScheme.outlineVariant.withOpacity(0.35)),
               itemBuilder: (context, i) {
                 final r = rows[i];
-                final isPercent = r.label.contains('比例');
+                final isPercent = r.unit == '%' || r.label.contains('%') || r.label.contains('比例');
                 return _DataRowResponsive(
                   label: r.label,
                   unit: r.unit,
@@ -322,7 +580,7 @@ class _StatsPanel extends StatelessWidget {
 
   static String _fmt(double? v, {required bool isPercent}) {
     if (v == null || v.isNaN || v.isInfinite) return '—';
-    if (isPercent) return '${v.toStringAsFixed(3)}%';
+    if (isPercent) return '${v.toStringAsFixed(0)}%';
     return v.toStringAsFixed(2);
   }
 }
@@ -330,16 +588,16 @@ class _StatsPanel extends StatelessWidget {
 class _FrozenHeaderRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    const headerStyle = TextStyle(fontSize: 13, fontWeight: FontWeight.w700);
+    const headerStyle = TextStyle(fontSize: 14, fontWeight: FontWeight.w700);
     return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
+      padding: const EdgeInsets.fromLTRB(10, 10, 10, 10),
       child: Row(
         children: const [
-          Expanded(flex: 42, child: Text('通道', style: headerStyle)),
-          Expanded(flex: 14, child: Text('最小', style: headerStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 14, child: Text('中間值', style: headerStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 14, child: Text('95%', style: headerStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 16, child: Text('最大', style: headerStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 32, child: Text('通道', style: headerStyle)),
+          Expanded(flex: 17, child: Text('最小', style: headerStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text('中間值', style: headerStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text('95%', style: headerStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text('最大', style: headerStyle, textAlign: TextAlign.right)),
         ],
       ),
     );
@@ -365,18 +623,18 @@ class _DataRowResponsive extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final left = unit.isEmpty ? label : '$label\n($unit)';
-    const cellStyle = TextStyle(fontSize: 13);
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+    final left = unit.isEmpty ? label : '$label($unit)';
+    const cellStyle = TextStyle(fontSize: 14, height: 1.0);
+    return SizedBox(
+      height: 44,
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.center,
         children: [
-          Expanded(flex: 42, child: Text(left, style: cellStyle)),
-          Expanded(flex: 14, child: Text(min, style: cellStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 14, child: Text(median, style: cellStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 14, child: Text(p95, style: cellStyle, textAlign: TextAlign.right)),
-          Expanded(flex: 16, child: Text(max, style: cellStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 32, child: Text(left, style: cellStyle)),
+          Expanded(flex: 17, child: Text(min, style: cellStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text(median, style: cellStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text(p95, style: cellStyle, textAlign: TextAlign.right)),
+          Expanded(flex: 17, child: Text(max, style: cellStyle, textAlign: TextAlign.right)),
         ],
       ),
     );
@@ -424,4 +682,18 @@ String _formatDateToChinese(DateTime d) {
   final m = d.month.toString().padLeft(2, '0');
   final day = d.day.toString().padLeft(2, '0');
   return '${y}年${m}月${day}日';
+}
+
+
+String _formatHm(DateTime dt) {
+  final h = dt.hour.toString().padLeft(2, '0');
+  final m = dt.minute.toString().padLeft(2, '0');
+  return '${h}時${m}分';
+}
+
+String _formatDurationHm(Duration d) {
+  final totalMinutes = d.inMinutes;
+  final hh = (totalMinutes ~/ 60).toString().padLeft(2, '0');
+  final mm = (totalMinutes % 60).toString().padLeft(2, '0');
+  return '${hh}時${mm}分';
 }

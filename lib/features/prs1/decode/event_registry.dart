@@ -213,6 +213,14 @@ class EventRegistry {
         return Prs1EventType.snore;
       case 0x12:
         return Prs1EventType.periodicBreathing;
+      case 0x13:
+        return Prs1EventType.rera;
+      case 0x14:
+        return Prs1EventType.vibratorySnore;
+      case 0x15:
+        return Prs1EventType.vibratorySnore2;
+      case 0x16:
+        return Prs1EventType.breathNotDetected;
       case 0x20:
         return Prs1EventType.largeLeak;
       case 0x30:
