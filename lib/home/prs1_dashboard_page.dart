@@ -11,6 +11,8 @@ import 'charts/prs1_chart_leak_rate.dart';
 import 'charts/prs1_chart_tidal_volume.dart';
 import 'charts/prs1_chart_resp_rate.dart';
 import 'charts/prs1_chart_minute_vent.dart';
+import 'charts/prs1_chart_insp_time.dart';
+import 'charts/prs1_chart_exp_time.dart';
 import 'package:tophome/features/prs1/derive/prs1_event_deriver.dart';
 
 // --- Brand color helpers (keep Layer-3 colors synced with selected BrandColor) ---
@@ -357,6 +359,20 @@ final ahiStats = _statsOfValues(ahiSeries.isEmpty ? <double>[] : ahiSeries);
                     const SizedBox(height: 12),
                     if (sessionStart != null && sessionEnd != null)
                       Prs1ChartMinuteVent(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        bucket: b,
+                      ),
+                    const SizedBox(height: 12),
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartInspTime(
+                        sessionStart: sessionStart,
+                        sessionEnd: sessionEnd,
+                        bucket: b,
+                      ),
+                    const SizedBox(height: 12),
+                    if (sessionStart != null && sessionEnd != null)
+                      Prs1ChartExpTime(
                         sessionStart: sessionStart,
                         sessionEnd: sessionEnd,
                         bucket: b,

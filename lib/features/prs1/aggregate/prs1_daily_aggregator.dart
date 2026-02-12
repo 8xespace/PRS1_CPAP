@@ -31,6 +31,12 @@ import '../stats/prs1_rolling_metrics.dart';
 import 'prs1_daily_models.dart';
 import '../stats/prs1_time_weighted_stats.dart';
 
+/// Debug gate for noisy CLI prints related to Ti/Te (.005 breath segmentation).
+///
+/// Keep the code (useful for OSCAR reverse-engineering / validation), but default
+/// to OFF so the Chrome console stays clean.
+const bool kPrs1LogTiTeCli = false;
+
 /// Reference (ground truth) values exported from OSCAR for validation.
 ///
 /// This is a temporary in-code map while we validate the engine; later we can
@@ -284,6 +290,10 @@ class _MutableBucket {
   // Breath-by-breath (Milestone E)
   final List<Prs1Breath> breaths = [];
 
+  // Phase-1 checkpoint logging: ensure we only print once per bucket.
+  bool _didLogBreathStats = false;
+  bool _didLogRollingLengths = false;
+
   int usageSeconds = 0;
 
   double? ahi;
@@ -388,6 +398,8 @@ class _MutableBucket {
   List<Prs1TimePoint> rollingMinuteVent5m = const [];
   List<Prs1TimePoint> rollingRespRate5m = const [];
   List<Prs1TimePoint> rollingTidalVolume5m = const [];
+  List<Prs1TimePoint> rollingInspTime5m = const [];
+  List<Prs1TimePoint> rollingExpTime5m = const [];
   List<Prs1TimePoint> rollingAhi10m = const [];
   List<Prs1TimePoint> rollingAhi30m = const [];
 
@@ -826,10 +838,28 @@ class _MutableBucket {
         windowMinutes: 5,
         valueOf: (b) => (b.tidalVolumeLiters * 1000.0),
       );
+
+      // Phase 2: add Ti/Te rolling time series (seconds).
+      // These will back the Insp/Exp Time charts later, but Phase 2 is engine-only.
+      rollingInspTime5m = Prs1RollingMetrics.rollingMedianBreathMetric(
+        dayStartEpochSec: bucketStartEpochSec,
+        breaths: breaths,
+        windowMinutes: 5,
+        valueOf: (b) => b.inspTimeSec,
+      );
+
+      rollingExpTime5m = Prs1RollingMetrics.rollingMedianBreathMetric(
+        dayStartEpochSec: bucketStartEpochSec,
+        breaths: breaths,
+        windowMinutes: 5,
+        valueOf: (b) => b.expTimeSec,
+      );
     } else {
       rollingMinuteVent5m = const [];
       rollingRespRate5m = const [];
       rollingTidalVolume5m = const [];
+      rollingInspTime5m = const [];
+      rollingExpTime5m = const [];
     }
 
     // IMPORTANT:
@@ -994,6 +1024,37 @@ double? _maxValueFromIntervals(List<Prs1WeightedInterval<double>> intervals) {
     );
   }
   Prs1DailyBucket freeze() {
+    // Phase 1 checkpoint: prove .005 Flow waveform → breaths is stable on this SD card,
+    // and that Ti/Te weighted stats are in the same order of magnitude as OSCAR.
+    // (No UI changes in this phase.)
+    if (kPrs1LogTiTeCli && !_didLogBreathStats) {
+      _didLogBreathStats = true;
+      String f(double? v) => v == null ? 'null' : v.toStringAsFixed(2);
+      // breaths[] is built only from Flow waveform segmentation (high-rate .005).
+      // insp/exp stats are weighted by breath duration seconds.
+      // Typical OSCAR reference (your screenshot): insp median ~3.19, exp median ~1.77.
+      // We only require same-scale plausibility here.
+      // ignore: avoid_print
+      print(
+        'PRS1 .005 breaths checkpoint: day=${day.year.toString().padLeft(4, "0")}-${day.month.toString().padLeft(2, "0")}-${day.day.toString().padLeft(2, "0")} '
+        'breaths=${breaths.length} '
+        'inspMed=${f(inspTimeMedian)} inspP95=${f(inspTimeP95)} '
+        'expMed=${f(expTimeMedian)} expP95=${f(expTimeP95)}',
+      );
+    }
+
+    // Phase 2 checkpoint: rolling minute-series for Ti/Te.
+    // We expect a stable per-minute series for the whole bucket (often 1440 points),
+    // but accept any non-empty stable length at this stage.
+    if (kPrs1LogTiTeCli && !_didLogRollingLengths) {
+      _didLogRollingLengths = true;
+      // ignore: avoid_print
+      print(
+        'PRS1 .005 Ti/Te rolling length: day=${day.year.toString().padLeft(4, "0")}-${day.month.toString().padLeft(2, "0")}-${day.day.toString().padLeft(2, "0")} '
+        'insp5mLen=${rollingInspTime5m.length} exp5mLen=${rollingExpTime5m.length}',
+      );
+    }
+
     return Prs1DailyBucket(
       day: day,
       slices: List.unmodifiable(slices),
@@ -1092,6 +1153,8 @@ double? _maxValueFromIntervals(List<Prs1WeightedInterval<double>> intervals) {
       rollingMinuteVent5m: List.unmodifiable(rollingMinuteVent5m),
       rollingRespRate5m: List.unmodifiable(rollingRespRate5m),
       rollingTidalVolume5m: List.unmodifiable(rollingTidalVolume5m),
+      rollingInspTime5m: List.unmodifiable(rollingInspTime5m),
+      rollingExpTime5m: List.unmodifiable(rollingExpTime5m),
       rollingAhi10m: List.unmodifiable(rollingAhi10m),
       rollingAhi30m: List.unmodifiable(rollingAhi30m),
     );

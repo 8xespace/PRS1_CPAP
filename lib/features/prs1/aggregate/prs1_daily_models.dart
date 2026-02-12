@@ -126,6 +126,8 @@ class Prs1DailyBucket {
     required this.rollingMinuteVent5m,
     required this.rollingRespRate5m,
     required this.rollingTidalVolume5m,
+    required this.rollingInspTime5m,
+    required this.rollingExpTime5m,
     required this.rollingAhi10m,
     required this.rollingAhi30m,
   });
@@ -305,6 +307,8 @@ class Prs1DailyBucket {
   final List<Prs1TimePoint> rollingMinuteVent5m;
   final List<Prs1TimePoint> rollingRespRate5m;
   final List<Prs1TimePoint> rollingTidalVolume5m;
+  final List<Prs1TimePoint> rollingInspTime5m;
+  final List<Prs1TimePoint> rollingExpTime5m;
   final List<Prs1TimePoint> rollingAhi10m;
   final List<Prs1TimePoint> rollingAhi30m;
 

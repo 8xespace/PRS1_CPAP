@@ -176,6 +176,9 @@ class _ChunkSummary {
   double? flowWaveSampleRateHz;
   int? flowWaveStartEpochMs;
 
+  // Phase0: log .005 waveform header summary once per session (safety checkpoint).
+  bool loggedWave005Header = false;
+
 
   /// Best-effort device minimum pressure setting (cmH2O) extracted from settings chunks (.001).
   double? minPressureSettingCmH2O;
@@ -340,6 +343,19 @@ List<Prs1Session> _parseChunkFile(Uint8List bytes, {String? sourcePath}) {
             dataEnd -= 4;
           }
           final dataLen = dataEnd - p;
+
+          // Phase0 checkpoint: log .005 waveform header summary (once per session) for reverse-engineering parity with OSCAR.
+          if (!summary.loggedWave005Header) {
+            summary.loggedWave005Header = true;
+            Log.d(
+              'PRS1 .005 header: sid=$sessionId fv=$fileVersion htype=$htype ext=$ext '
+              'intervalCount=$intervalCount intervalSec=$intervalSeconds signals=$wvfmSignals '
+              'flowInterleave=${flowInterleave ?? -1} sampleRateHz=${sampleRateHz.toStringAsFixed(3)} '
+              'sampleCount=$sampleCount dataLen=$dataLen blockSize=$blockSize pos=$pos '
+              'src=${sourcePath ?? "(mem)"}',
+              tag: 'PRS1',
+            );
+          }
           if (sampleCount > 0 && dataLen >= sampleCount) {
             // Use a conservative scale that matches OSCAR magnitude for PRS1 DreamStation.
             const double kFlowScaleLpmPerCount = 1.095;
