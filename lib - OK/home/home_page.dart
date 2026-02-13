@@ -26,7 +26,6 @@ import 'bottom_controls_bar.dart';
 import 'home_header.dart';
 import 'prs1_dashboard_page.dart';
 import '../features/prs1/waveform/prs1_waveform_index.dart';
-import '../features/prs1/debug/prs1_phase1_compare.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -472,105 +471,6 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  
-
-  // Phase 1 helper (Web): pick two zips and print a consistent debug summary
-  // for the target day so we can verify provenance and field existence.
-  Future<void> _phase1ComparePickZips() async {
-    if (!kIsWeb) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Phase 1 compare is Web-only (zip picker).')),
-      );
-      return;
-    }
-
-    final appStateStore0 = appStateStore;
-
-    setState(() {
-      _busy = true;
-      _status = 'Phase1: 請先選擇 PRS1.zip（來源 A）...';
-      _scanDone = 0;
-      _scanTotal = 0;
-    });
-
-    try {
-      final a = await WebZipImport.pickZipBytes();
-      if (a == null) {
-        setState(() {
-          _busy = false;
-          _status = 'Phase1: 已取消（未選擇來源 A）';
-        });
-        return;
-      }
-
-      setState(() {
-        _status = 'Phase1: 已選擇 ${a.name}。接著選擇 data.zip（來源 B）...';
-      });
-
-      final b = await WebZipImport.pickZipBytes();
-      if (b == null) {
-        setState(() {
-          _busy = false;
-          _status = 'Phase1: 已取消（未選擇來源 B）';
-        });
-        return;
-      }
-
-      // Enter computing phase hint (same UX rule as parse/aggregate)
-      await _enterComputingPhase(appStateStore0);
-
-      final aBuild = WebZipImport.buildSnapshotFromZip(
-        zipBytes: a.bytes,
-        zipName: a.name,
-        isPrs1Candidate: (p) => _isPrs1Candidate(p),
-      );
-      final bBuild = WebZipImport.buildSnapshotFromZip(
-        zipBytes: b.bytes,
-        zipName: b.name,
-        isPrs1Candidate: (p) => _isPrs1Candidate(p),
-      );
-
-      // Target day: local midnight of the OSCAR screenshot date (2026/1/30).
-      final targetDay = DateTime(2026, 1, 30);
-
-      // Print to console in a stable format.
-      await Prs1Phase1Compare.runCompareFromPrs1Blobs(
-        labelA: a.name,
-        prs1BlobsA: aBuild.prs1BytesByRelPath,
-        labelB: b.name,
-        prs1BlobsB: bBuild.prs1BytesByRelPath,
-        targetDayLocalMidnight: targetDay,
-        log: (line) => logD('[Phase1] $line'),
-      );
-
-      await _leaveComputingPhaseIfNeeded(appStateStore0);
-      appStateStore0.setEnginePhase(EnginePhase.idle);
-
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        _status = 'Phase1 完成：已輸出 debug summary（請看 Console）。';
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Phase1 完成：請到 Console 比對兩份 summary 與 diff。')),
-      );
-    } catch (err) {
-      await _leaveComputingPhaseIfNeeded(appStateStore0);
-      appStateStore0.setEnginePhase(EnginePhase.idle);
-
-      if (!mounted) return;
-      setState(() {
-        _busy = false;
-        _status = 'Phase1 失敗：$err';
-      });
-
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Phase1 失敗：$err')),
-      );
-    }
-  }
-
 @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -744,15 +644,6 @@ class _HomePageState extends State<HomePage> {
                           );
                         },
                       ),
-
-                      if (kDebugMode && kIsWeb) ...[
-                        const SizedBox(height: 10),
-                        OutlinedButton.icon(
-                          onPressed: _busy ? null : _phase1ComparePickZips,
-                          icon: const Icon(Icons.bug_report, size: 20),
-                          label: const Text('Phase 1 同源驗證：比較兩個 ZIP（Console）'),
-                        ),
-                      ],
 
                       const SizedBox(height: 12),
                       Container(

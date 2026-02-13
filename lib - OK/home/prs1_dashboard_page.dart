@@ -1,9 +1,7 @@
 import 'dart:math' as math;
 import 'package:flutter/material.dart';
-import 'package:flutter/foundation.dart';
 import '../app_state.dart';
 import '../features/prs1/aggregate/prs1_daily_models.dart';
-import '../features/prs1/debug/prs1_phase4_validate.dart';
 import '../features/prs1/model/prs1_waveform_channel.dart';
 import '../features/prs1/stats/prs1_rolling_metrics.dart';
 import 'charts/prs1_chart_events.dart';
@@ -246,40 +244,7 @@ final snoreStats = _statsOfValues(snoreSeries);
         ),
         centerTitle: true,
         title: const Text('我的本周睡眠呼吸紀錄'),
-        actions: [
-          if (kDebugMode && b != null)
-            IconButton(
-              tooltip: 'Phase4 Validate (OSCAR)',
-              icon: const Icon(Icons.verified),
-              onPressed: () {
-                final start = sessionStart ?? b!.day;
-                final end = sessionEnd ?? start.add(const Duration(hours: 8));
-                final report = Prs1Phase4Validator.buildReport(
-                  bucket: b!,
-                  sessionStartLocal: start,
-                  sessionEndLocal: end,
-                );
-                showDialog(
-                  context: context,
-                  builder: (ctx) => AlertDialog(
-                    title: const Text('Phase4 Validation'),
-                    content: SizedBox(
-                      width: 720,
-                      child: SingleChildScrollView(
-                        child: SelectableText(report),
-                      ),
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.of(ctx).pop(),
-                        child: const Text('OK'),
-                      ),
-                    ],
-                  ),
-                );
-              },
-            ),
-        ],
+        actions: const [],
       ),
       body: SafeArea(
         child: LayoutBuilder(
