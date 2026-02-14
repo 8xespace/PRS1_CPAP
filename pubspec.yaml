@@ -2,11 +2,14 @@ name: tophome
 description: TopHome intro splash
 publish_to: "none"
 
+version: 1.0.0+1 
+
 environment:
   sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   archive: ^3.6.1
+  path: ^1.9.0
   flutter:
     sdk: flutter
 
