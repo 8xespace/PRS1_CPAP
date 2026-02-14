@@ -2,33 +2,29 @@ import UIKit
 import Flutter
 import UniformTypeIdentifiers
 
-@UIApplicationMain
+@main
 @objc class AppDelegate: FlutterAppDelegate, UIDocumentPickerDelegate {
+
   private var pendingResult: FlutterResult?
-  private let bookmarkKey = "cpap_folder_bookmark_b64"
-  private var securityScopedURL: URL?
+  private let bookmarkKey = "cpap_folder_bookmark_v1"
 
   override func application(
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-    let controller: FlutterViewController = window?.rootViewController as! FlutterViewController
 
+    let controller: FlutterViewController = window?.rootViewController as! FlutterViewController
     let channel = FlutterMethodChannel(name: "cpap.folder_access", binaryMessenger: controller.binaryMessenger)
 
     channel.setMethodCallHandler { [weak self] call, result in
       guard let self = self else { return }
       switch call.method {
-      case "restoreBookmark":
-        self.handleRestoreBookmark(result: result)
       case "pickFolder":
-        self.handlePickFolder(result: result)
-      case "persistBookmark":
-        if let args = call.arguments as? [String: Any],
-           let b64 = args["bookmark"] as? String {
-          UserDefaults.standard.set(b64, forKey: self.bookmarkKey)
-        }
-        result(nil)
+        self.presentFolderPicker(result: result)
+      case "restoreBookmark":
+        self.restoreBookmark(result: result)
+      case "clearBookmark":
+        self.clearBookmark(result: result)
       default:
         result(FlutterMethodNotImplemented)
       }
@@ -38,105 +34,79 @@ import UniformTypeIdentifiers
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
   }
 
-  private func handleRestoreBookmark(result: @escaping FlutterResult) {
-    guard let b64 = UserDefaults.standard.string(forKey: bookmarkKey),
-          let data = Data(base64Encoded: b64) else {
-      result(["granted": false, "path": NSNull()])
-      return
-    }
+  // MARK: - Picker
 
-    var stale = false
-    do {
-      let url = try URL(resolvingBookmarkData: data,
-                        options: [.withSecurityScope],
-                        relativeTo: nil,
-                        bookmarkDataIsStale: &stale)
-
-      if stale {
-        // If stale, we still try to access; user may need to re-pick.
-      }
-
-      if url.startAccessingSecurityScopedResource() {
-        self.securityScopedURL?.stopAccessingSecurityScopedResource()
-        self.securityScopedURL = url
-        result(["granted": true, "path": url.path])
-      } else {
-        result(["granted": false, "path": NSNull()])
-      }
-    } catch {
-      result(["granted": false, "path": NSNull()])
-    }
-  }
-
-  private func handlePickFolder(result: @escaping FlutterResult) {
-    // Avoid concurrent pickers.
+  private func presentFolderPicker(result: @escaping FlutterResult) {
     if pendingResult != nil {
-      result(["granted": false, "path": NSNull()])
+      result(FlutterError(code: "BUSY", message: "Another folder picker request is in progress.", details: nil))
       return
     }
     pendingResult = result
 
-    DispatchQueue.main.async {
-      let picker: UIDocumentPickerViewController
-      if #available(iOS 14.0, *) {
-        picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
-      } else {
-        // iOS 13 fallback: best-effort (folder picking is limited). Use public.data to allow picking a file, then user can choose a folder-like provider.
-        picker = UIDocumentPickerViewController(documentTypes: ["public.folder"], in: .open)
-      }
-      picker.delegate = self
-      picker.allowsMultipleSelection = false
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
+    picker.delegate = self
+    picker.allowsMultipleSelection = false
+    picker.modalPresentationStyle = .formSheet
 
-      if let root = self.window?.rootViewController {
-        root.present(picker, animated: true, completion: nil)
-      } else {
-        self.finishPick(granted: false, url: nil, bookmarkB64: nil)
-      }
-    }
+    window?.rootViewController?.present(picker, animated: true, completion: nil)
   }
 
-  // MARK: - UIDocumentPickerDelegate
-
   func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-    finishPick(granted: false, url: nil, bookmarkB64: nil)
+    pendingResult?(FlutterError(code: "CANCELLED", message: "User cancelled folder selection.", details: nil))
+    pendingResult = nil
   }
 
   func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
     guard let url = urls.first else {
-      finishPick(granted: false, url: nil, bookmarkB64: nil)
+      pendingResult?(FlutterError(code: "NO_URL", message: "No folder URL returned.", details: nil))
+      pendingResult = nil
       return
     }
 
-    // Start security-scoped access and create a bookmark for persistence.
-    let granted = url.startAccessingSecurityScopedResource()
-    if granted {
-      self.securityScopedURL?.stopAccessingSecurityScopedResource()
-      self.securityScopedURL = url
+    let ok = url.startAccessingSecurityScopedResource()
+    defer { if ok { url.stopAccessingSecurityScopedResource() } }
+
+    do {
+      let data = try url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
+      UserDefaults.standard.set(data, forKey: bookmarkKey)
+    } catch {
+      // Ignore persisting failures; selection still works for this session.
     }
 
-    var b64: String? = nil
-    if granted {
-      do {
-        let data = try url.bookmarkData(options: [.withSecurityScope],
-                                        includingResourceValuesForKeys: nil,
-                                        relativeTo: nil)
-        b64 = data.base64EncodedString()
-        UserDefaults.standard.set(b64, forKey: bookmarkKey)
-      } catch {
-        // If bookmark fails, we still return path; user may need to pick again next time.
-      }
-    }
-
-    finishPick(granted: granted, url: url, bookmarkB64: b64)
+    pendingResult?(url.path)
+    pendingResult = nil
   }
 
-  private func finishPick(granted: Bool, url: URL?, bookmarkB64: String?) {
-    let res = pendingResult
-    pendingResult = nil
+  // MARK: - Bookmark restore
 
-    let pathVal: Any = url?.path ?? NSNull()
-    let bVal: Any = bookmarkB64 ?? NSNull()
+  private func restoreBookmark(result: @escaping FlutterResult) {
+    guard let data = UserDefaults.standard.data(forKey: bookmarkKey) else {
+      result(FlutterError(code: "NO_BOOKMARK", message: "No saved folder authorization.", details: nil))
+      return
+    }
 
-    res?(["granted": granted, "path": pathVal, "bookmark": bVal])
+    var isStale = false
+    do {
+      let url = try URL(resolvingBookmarkData: data, options: [], relativeTo: nil, bookmarkDataIsStale: &isStale)
+
+      let ok = url.startAccessingSecurityScopedResource()
+      defer { if ok { url.stopAccessingSecurityScopedResource() } }
+
+      if isStale {
+        do {
+          let newData = try url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
+          UserDefaults.standard.set(newData, forKey: bookmarkKey)
+        } catch { /* ignore */ }
+      }
+
+      result(url.path)
+    } catch {
+      result(FlutterError(code: "BOOKMARK_FAIL", message: "Failed to resolve saved authorization.", details: String(describing: error)))
+    }
+  }
+
+  private func clearBookmark(result: @escaping FlutterResult) {
+    UserDefaults.standard.removeObject(forKey: bookmarkKey)
+    result(true)
   }
 }

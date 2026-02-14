@@ -1,5 +1,6 @@
 // lib/features/local_fs/local_fs_io.dart
 
+import 'package:path/path.dart' as p;
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -25,7 +26,7 @@ class LocalFs {
     await for (final ent in root.list(recursive: true, followLinks: false)) {
       if (ent is! File) continue;
       final abs = ent.path;
-      final rel = PathUtils.relativeTo(rootPath, from: abs);
+      final rel = p.relative(abs, from: rootPath);
       final size = await ent.length();
       out.add(LocalFsEntry(absolutePath: abs, relativePath: rel, size: size));
     }

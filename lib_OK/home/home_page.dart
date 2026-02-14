@@ -621,22 +621,7 @@ class _HomePageState extends State<HomePage> {
                           );
 
                           final isIOS = (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS);
-                          final hasGranted = _folderState.isGranted && (_folderState.folderPath?.isNotEmpty ?? false);
 
-                          final openGrantedBtn = FilledButton.icon(
-                            onPressed: (_busy || !isIOS) ? null : _openGrantedFolderAndParse,
-                            style: FilledButton.styleFrom(
-                              minimumSize: Size.fromHeight(bigHeight),
-                              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
-                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                              textStyle: theme.textTheme.titleMedium?.copyWith(
-                                fontWeight: FontWeight.w800,
-                                letterSpacing: 0.2,
-                              ),
-                            ),
-                            icon: Icon(hasGranted ? Icons.folder_open : Icons.lock_open, size: 24),
-                            label: Text(hasGranted ? '開啟已授權目錄' : '尚未授權（先選一次）'),
-                          );
 
                           final buttons = isIOS
                               ? (isWide
@@ -645,8 +630,6 @@ class _HomePageState extends State<HomePage> {
                                       children: [
                                         Row(
                                           children: [
-                                            Expanded(child: openGrantedBtn),
-                                            const SizedBox(width: 10),
                                             Expanded(child: readBtn),
                                           ],
                                         ),
@@ -657,8 +640,6 @@ class _HomePageState extends State<HomePage> {
                                   : Column(
                                       crossAxisAlignment: CrossAxisAlignment.stretch,
                                       children: [
-                                        openGrantedBtn,
-                                        const SizedBox(height: 10),
                                         readBtn,
                                         const SizedBox(height: 10),
                                         recordsBtn,
