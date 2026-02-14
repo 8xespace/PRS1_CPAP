@@ -329,8 +329,8 @@ class _EventsPainter extends CustomPainter {
       final laneRect = Rect.fromLTWH(leftPad, y0, plotW, laneH);
       final laneBg = Paint()
         ..color = (i % 2 == 0)
-            ? colorScheme.surfaceVariant.withOpacity(0.35)
-            : colorScheme.surfaceVariant.withOpacity(0.18);
+            ? Color.alphaBlend(colorScheme.surfaceVariant.withOpacity(0.35), colorScheme.surface)
+            : Color.alphaBlend(colorScheme.surfaceVariant.withOpacity(0.18), colorScheme.surface);
       canvas.drawRect(laneRect, laneBg);
 
       final grid = Paint()

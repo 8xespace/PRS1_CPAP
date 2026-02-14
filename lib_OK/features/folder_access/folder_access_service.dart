@@ -12,7 +12,8 @@ class FolderAccessService {
   Future<bool> restore(FolderAccessState state) async {
     final res = await _platform.restoreBookmark();
     if (res.granted) {
-      state.setGranted(granted: true, folderPath: res.folderPath);
+      final p = _normalizePath(res.folderPath);
+      state.setGranted(granted: true, folderPath: p);
       return true;
     }
     return false;
@@ -23,9 +24,28 @@ class FolderAccessService {
     final res = await _platform.pickFolder();
     if (res.granted) {
       await _platform.persistBookmark(res);
-      state.setGranted(granted: true, folderPath: res.folderPath);
+      final p = _normalizePath(res.folderPath);
+      state.setGranted(granted: true, folderPath: p);
       return true;
     }
     return false;
+  }
+
+  /// iOS native side sometimes returns a file URL string (file:///...).
+  /// dart:io expects a plain filesystem path.
+  String? _normalizePath(String? folderPath) {
+    if (folderPath == null) return null;
+    final s = folderPath.trim();
+    if (s.isEmpty) return null;
+
+    if (s.startsWith('file://')) {
+      try {
+        return Uri.parse(s).toFilePath();
+      } catch (_) {
+        // Fallback: strip scheme.
+        return s.replaceFirst(RegExp(r'^file://+'), '/');
+      }
+    }
+    return s;
   }
 }

@@ -505,10 +505,20 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       if (!mounted) return;
-      appStateStore.setEnginePhase(EnginePhase.error, message: '發生錯誤：$e');
+
+      // Give a more actionable message for iOS folder permission issues.
+      var msg = '發生錯誤：$e';
+
+      // Web/Chrome 不會有 iOS 的資料夾授權問題；iOS 只要遇到「選得到但掃不到」，
+      // 幾乎都是 security-scoped + sandbox 路徑問題，因此直接給出可操作的提示即可。
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS) {
+        msg = '讀取資料夾失敗（iOS 權限/路徑問題）：$e\n\n建議：iOS 上必須使用「安全性範圍資料夾（security-scoped）」授權，並在 native 端把選取的資料夾複製到 App sandbox 後再讓 Flutter 掃描。';
+      }
+
+      appStateStore.setEnginePhase(EnginePhase.error, message: msg);
       setState(() {
         _busy = false;
-        _status = '發生錯誤：$e';
+        _status = msg;
       });
     }
   }
@@ -522,7 +532,7 @@ class _HomePageState extends State<HomePage> {
     final snap = appState.importSnapshot;
 
     return Scaffold(
-      backgroundColor: cs.surfaceVariant.withOpacity(0.35),
+      backgroundColor: Color.alphaBlend(cs.surfaceVariant.withOpacity(0.35), cs.surface),
       body: SafeArea(
         child: Column(
           children: [
@@ -539,7 +549,7 @@ class _HomePageState extends State<HomePage> {
                     child: Container(
                       width: double.infinity,
                       decoration: BoxDecoration(
-                    color: cs.surfaceVariant.withOpacity(0.45),
+                    color: Color.alphaBlend(cs.surfaceVariant.withOpacity(0.45), cs.surface),
                     borderRadius: BorderRadius.circular(18),
                     border: Border.all(
                       color: cs.outlineVariant.withOpacity(0.35),
