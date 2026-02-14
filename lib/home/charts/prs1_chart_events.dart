@@ -294,8 +294,8 @@ class _EventsPainter extends CustomPainter {
     _LaneDef(Prs1EventType.flowLimitation, '氣流限制', Color(0xFFFFE066)), // FL
     _LaneDef(Prs1EventType.rera, '呼吸引發的覺醒', Color(0xFFFFC857)), // RE
     // VS / VS2 must appear directly under RE (per OSCAR lane order).
-    _LaneDef(Prs1EventType.vibratorySnore, '震動式打鼾 (VS)', Color(0xFFFF6B6B)),
-    _LaneDef(Prs1EventType.vibratorySnore2, '震動式打鼾 (VS2)', Color(0xFFE53935)),
+    _LaneDef(Prs1EventType.vibratorySnore, '打鼾 VS', Color(0xFFFF6B6B)),
+    _LaneDef(Prs1EventType.vibratorySnore2, '打鼾 VS2', Color(0xFFE53935)),
     _LaneDef(Prs1EventType.pressurePulse, '壓力脈衝', Color(0xFF9AA0A6)), // PP
     _LaneDef(Prs1EventType.breathNotDetected, '未監測到呼吸', Color(0xFF616161)), // BND
   ];

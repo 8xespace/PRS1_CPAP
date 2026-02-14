@@ -2,7 +2,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart';
+import 'package:flutter/foundation.dart' show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
 
 import '../app_state.dart';
@@ -298,6 +298,7 @@ class _HomePageState extends State<HomePage> {
   }
 
   Future<void> _readFolderAndParse() async {
+    // Web: keep existing import pipeline (folder picker / ZIP) unchanged.
     if (kIsWeb) {
       await _importZipAndParseWeb();
       return;
@@ -328,6 +329,47 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
+    await _parseFolderPath(folderPath);
+  }
+
+  /// iOS「第二個開啟功能」：優先使用已恢復/已授權的資料夾（security-scoped bookmark）。
+  /// - 不會覆蓋 Web 流程（Web 仍走原本匯入）
+  /// - 若尚未授權，會提示使用者改按「讀取記憶卡」重新選取
+  Future<void> _openGrantedFolderAndParse() async {
+    if (kIsWeb) {
+      // Web 不支援 security-scoped bookmark；保持原有流程即可。
+      await _importZipAndParseWeb();
+      return;
+    }
+    if (_busy) return;
+
+    setState(() {
+      _busy = true;
+      _status = '嘗試開啟已授權資料夾...';
+      _fileCount = 0;
+      _prs1BlobCount = 0;
+    });
+
+    appStateStore.setEnginePhase(EnginePhase.scanning, message: '掃描/讀取資料中...');
+
+    final ok = await _folderService.restore(_folderState);
+    final folderPath = _folderState.folderPath;
+
+    if (!mounted) return;
+
+    if (!ok || folderPath == null || folderPath.isEmpty) {
+      appStateStore.setEnginePhase(EnginePhase.idle);
+      setState(() {
+        _busy = false;
+        _status = '尚未授權資料夾（請改按「讀取記憶卡」選取一次）';
+      });
+      return;
+    }
+
+    await _parseFolderPath(folderPath);
+  }
+
+  Future<void> _parseFolderPath(String folderPath) async {
     try {
       setState(() {
         _status = '掃描檔案中...';
@@ -507,12 +549,11 @@ class _HomePageState extends State<HomePage> {
                   padding: const EdgeInsets.fromLTRB(16, 18, 16, 16),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [Text(
-                        kIsWeb
-                            ? 'Web 推薦做法：點「讀取記憶卡」→ 選一個 zip（整張 SD 卡或其子資料夾）。\n'
-                                '完成後：App 會立刻取得檔案清單＋相對路徑，並把 PRS1 相關檔案讀成 bytes 後開始解析。'
-                            : '推薦做法：點「讀取記憶卡」→ 選 USB/SD 卡根目錄（或其上層資料夾）。\n'
-                                '完成後：App 會立刻取得檔案清單＋相對路徑，並把 PRS1 相關檔案讀成 bytes 後開始解析。',
+                    children: [
+                      Text(
+                        '01. 請點擊「讀取記憶卡」，將位置指向陽壓呼吸器的記憶卡或是裝置中的指定目錄。\n'
+                        '02. 讀取完整檔案、進入統計引擎皆需要相當的運作時間，敬請您耐心等候。\n'
+                        '03. 本應用程式僅支援 Philips DreamStation 系列陽壓呼吸治療器檔案規格。',
                         style: theme.textTheme.bodyMedium,
                       ),
                       const SizedBox(height: 14),
@@ -579,22 +620,66 @@ class _HomePageState extends State<HomePage> {
                             label: const Text('我的紀錄'),
                           );
 
-                          final buttons = isWide
-                              ? Row(
-                                  children: [
-                                    Expanded(child: readBtn),
-                                    const SizedBox(width: 10),
-                                    Expanded(child: recordsBtn),
-                                  ],
-                                )
-                              : Column(
-                                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                                  children: [
-                                    readBtn,
-                                    const SizedBox(height: 10),
-                                    recordsBtn,
-                                  ],
-                                );
+                          final isIOS = (!kIsWeb && defaultTargetPlatform == TargetPlatform.iOS);
+                          final hasGranted = _folderState.isGranted && (_folderState.folderPath?.isNotEmpty ?? false);
+
+                          final openGrantedBtn = FilledButton.icon(
+                            onPressed: (_busy || !isIOS) ? null : _openGrantedFolderAndParse,
+                            style: FilledButton.styleFrom(
+                              minimumSize: Size.fromHeight(bigHeight),
+                              padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 18),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                              textStyle: theme.textTheme.titleMedium?.copyWith(
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 0.2,
+                              ),
+                            ),
+                            icon: Icon(hasGranted ? Icons.folder_open : Icons.lock_open, size: 24),
+                            label: Text(hasGranted ? '開啟已授權目錄' : '尚未授權（先選一次）'),
+                          );
+
+                          final buttons = isIOS
+                              ? (isWide
+                                  ? Column(
+                                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                                      children: [
+                                        Row(
+                                          children: [
+                                            Expanded(child: openGrantedBtn),
+                                            const SizedBox(width: 10),
+                                            Expanded(child: readBtn),
+                                          ],
+                                        ),
+                                        const SizedBox(height: 10),
+                                        recordsBtn,
+                                      ],
+                                    )
+                                  : Column(
+                                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                                      children: [
+                                        openGrantedBtn,
+                                        const SizedBox(height: 10),
+                                        readBtn,
+                                        const SizedBox(height: 10),
+                                        recordsBtn,
+                                      ],
+                                    ))
+                              : (isWide
+                                  ? Row(
+                                      children: [
+                                        Expanded(child: readBtn),
+                                        const SizedBox(width: 10),
+                                        Expanded(child: recordsBtn),
+                                      ],
+                                    )
+                                  : Column(
+                                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                                      children: [
+                                        readBtn,
+                                        const SizedBox(height: 10),
+                                        recordsBtn,
+                                      ],
+                                    ));
 
                           // 進度條（與狀態列等寬，並做響應式：
                           // - 窄版：僅顯示條
@@ -670,31 +755,82 @@ class _HomePageState extends State<HomePage> {
                           ],
                         ),
                       ),
-
                       const SizedBox(height: 18),
                       Expanded(
                         child: Builder(builder: (context) {
                           final bool showScanProgress = _scanTotal > 0;
                           final double? progressValue = showScanProgress ? (_scanDone / _scanTotal) : null;
+
+                          // 「統計引擎運作用中.........」出現後，就把注意事項關閉。
                           final bool showComputingHint =
                               (appState.enginePhase == EnginePhase.computing) &&
                               (!showScanProgress || (progressValue != null && progressValue >= 1.0));
-                          if (!showComputingHint) return const SizedBox.shrink();
-                          final msg = (appState.enginePhaseMessage.isNotEmpty)
-                              ? appState.enginePhaseMessage
-                              : '統計引擎運作中，請不要關閉本軟體';
-                          return Center(
-                            child: _SoftBlinkingHintText(
-                              key: const ValueKey('engine_hint_blink_center'),
-                              text: msg,
+
+                          // 注意事項：資料載入前顯示；一旦 computing hint 出現就關閉。
+                          final bool showNotice = appState.prs1Sessions.isEmpty && !showComputingHint;
+
+                          if (showComputingHint) {
+                            final msg = (appState.enginePhaseMessage.isNotEmpty)
+                                ? appState.enginePhaseMessage
+                                : '統計引擎運作中，請不要關閉本軟體';
+                            return Center(
+                              child: _SoftBlinkingHintText(
+                                key: const ValueKey('engine_hint_blink_center'),
+                                text: msg,
+                              ),
+                            );
+                          }
+
+                          if (!showNotice) return const SizedBox.shrink();
+
+                          // 「主題色的深色」底：用 brandColor 往黑色加深，確保深/淺主題都清楚。
+                          final Color bg = Color.lerp(appState.brandColor.color, Colors.black, 0.58)!;
+
+                          const String noticeText = '''注意事項
+
+免責聲明
+01. 本應用程式絕非醫學專業指導的替代品。
+02. 由於製造商對於文件格式釋出有限，本應用程式所顯示數據的準確性，無法以任何方式得到保證。
+03. 所有生成的統計數據報告僅供個人陽壓呼吸睡眠治療成果的參考資料，並旨在盡可能保持準確。
+04. 本應用程式的統計報告內容，是基於陽壓呼吸治療器所回報的數據。此類數據是否可用於合規性或其他目的，需由審核機構裁定。
+05. 雖然本應用程式可以得到陽壓治療呼吸器的統計資料，但它不是官方醫療診斷工具。
+06. 如果您對陽壓治療呼吸機的數據有疑慮，建議還是要諮詢您的呼吸治療師或是胸腔內科主治醫師。
+
+版權宣告
+01. 本應用程式基於 OSCAR 自由軟體（指自由度，而非僅指免費），依據 GNU 通用公共授權條款第三版 (GPL v3) 發佈。
+02. 本應用程式基於 OSCAR 自由軟體開源精神，因此依據 GNU 通用公共授權條款第三版 (GPL v3) 發佈。
+03. 本應用程式完整程式碼： https://github.com/8xespace/PRS1_CPAP
+04. 本應用程式不提供任何保證，且不對其在任何特定用途下的適用性做出任何聲明。
+05. 本應用程式在法律上聲明，不承擔任何軟體瑕疵或適用性的擔保責任。
+''';
+
+                          return Container(
+                            width: double.infinity,
+                            decoration: BoxDecoration(
+                              color: bg,
+                              borderRadius: BorderRadius.circular(14),
+                              border: Border.all(color: Colors.white.withOpacity(0.12)),
+                            ),
+                            child: ClipRRect(
+                              borderRadius: BorderRadius.circular(14),
+                              child: Scrollbar(
+                                thumbVisibility: true,
+                                child: SingleChildScrollView(
+                                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                                  child: Text(
+                                    noticeText,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color: Colors.white,
+                                      height: 1.35,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ),
                           );
                         }),
                       ),
-
-                      
-
-                    ],
+],
                   ),
                 ),
                   ),

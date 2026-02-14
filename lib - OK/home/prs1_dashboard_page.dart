@@ -443,17 +443,10 @@ final snoreStats = _statsOfValues(snoreSeries);
               );
             }
 
-            // iPhone / 窄螢幕：用左右滑的方式（左：統計；右：圖表）
-return PageView(
-              children: [
-                leftPanel,
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
-                  child: rightPanelWithCharts,
-                ),
-              ],
-            );
-          },
+            // iPhone / 窄螢幕：僅顯示左側統計（iPad 才顯示完整右側圖表）
+            return leftPanel;
+
+            },
         ),
       ),
     );

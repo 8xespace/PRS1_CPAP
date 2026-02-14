@@ -316,30 +316,6 @@ class _CrossPainter extends CustomPainter {
     _drawSeries(canvas, plot, leak1m, leakMax, pLeak);
     _drawSeries(canvas, plot, snore1m, snoreMax, pSnore);
     _drawSeries(canvas, plot, fl1m, flMax, pFlow);
-
-    // legend
-    final legend = [
-      ('Leak', pLeak.color),
-      ('Snore', pSnore.color),
-      ('FL', pFlow.color),
-    ];
-
-    double lx = plot.left + 8;
-    final ly = plot.top + 6;
-    for (final item in legend) {
-      final dot = Paint()..color = item.$2;
-      canvas.drawCircle(Offset(lx, ly + 6), 3, dot);
-      lx += 8;
-      final tp = TextPainter(
-        text: TextSpan(
-          text: item.$1,
-          style: TextStyle(color: scheme.onSurface.withOpacity(0.75), fontSize: 12, fontWeight: FontWeight.w700),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, Offset(lx, ly));
-      lx += tp.width + 14;
-    }
   }
 
   void _drawSeries(Canvas canvas, Rect plot, List<double> v, double vmax, Paint paint) {
