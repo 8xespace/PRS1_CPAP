@@ -73,7 +73,7 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
       var stale = false
       let url = try URL(
         resolvingBookmarkData: data,
-        options: [.withSecurityScope],
+        options: [.withoutUI, .withoutMounting],
         relativeTo: nil,
         bookmarkDataIsStale: &stale
       )
@@ -85,7 +85,7 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
 
       if stale {
         do {
-          let newData = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+          let newData = try url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
           ud.set(newData.base64EncodedString(), forKey: kBookmark)
         } catch { }
       }
@@ -119,7 +119,7 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
     }
 
     do {
-      let bookmarkData = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+      let bookmarkData = try url.bookmarkData(options: [.minimalBookmark], includingResourceValuesForKeys: nil, relativeTo: nil)
       let b64 = bookmarkData.base64EncodedString()
       ud.set(b64, forKey: kBookmark)
 
