@@ -1,16 +1,3 @@
-// ios/Runner/FolderAccessPlugin.swift
-//
-// MethodChannel: "cpap.folder_access"
-//
-// Purpose:
-// - iOS folder pick returns a security-scoped URL that Flutter (dart:io) cannot
-//   reliably enumerate directly unless the resource is actively "started".
-// - To make scanning stable, we COPY the selected folder into the app sandbox
-//   (Application Support/ImportedPRS1/<uuid>/...) and return that sandbox path
-//   to Flutter. Flutter then uses dart:io to recursively list/read files.
-//
-// You MUST also wire this plugin from AppDelegate.swift (see README_IOS_FOLDER_ACCESS.md).
-
 import Foundation
 import Flutter
 import UIKit
@@ -38,6 +25,8 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
       pickFolder(result)
     case "restoreBookmark":
       restoreBookmark(result)
+    case "clearBookmark":
+      clearBookmark(result)
     case "persistBookmark":
       if let args = call.arguments as? [String: Any],
          let b64 = args["bookmark"] as? String,
@@ -52,33 +41,31 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
 
   private func pickFolder(_ result: @escaping FlutterResult) {
     guard pendingResult == nil else {
-      result(["granted": false, "path": NSNull(), "bookmark": NSNull()])
+      result(["granted": false, "path": NSNull(), "bookmark": NSNull(), "error": "BUSY"])
       return
     }
     guard let presenter = presenter else {
-      result(["granted": false, "path": NSNull(), "bookmark": NSNull()])
+      result(["granted": false, "path": NSNull(), "bookmark": NSNull(), "error": "NO_PRESENTER"])
       return
     }
 
     pendingResult = result
 
-    let types: [UTType] = [.folder]
-    let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: false)
+    let picker = UIDocumentPickerViewController(forOpeningContentTypes: [UTType.folder], asCopy: false)
     picker.allowsMultipleSelection = false
     picker.delegate = self
     presenter.present(picker, animated: true)
   }
 
   private func restoreBookmark(_ result: @escaping FlutterResult) {
-    // If we already have a copied sandbox path, prefer it (fast + no prompt).
     if let p = ud.string(forKey: kCopiedPath), FileManager.default.fileExists(atPath: p) {
-      result(["granted": true, "path": p])
+      result(["granted": true, "path": p, "error": NSNull()])
       return
     }
 
     guard let b64 = ud.string(forKey: kBookmark),
           let data = Data(base64Encoded: b64) else {
-      result(["granted": false, "path": NSNull()])
+      result(["granted": false, "path": NSNull(), "error": "NO_BOOKMARK"])
       return
     }
 
@@ -91,24 +78,34 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
         bookmarkDataIsStale: &stale
       )
 
-      // Recopy into sandbox on restore (keeps Flutter access stable).
-      let copied = try withSecurityScoped(url: url) { srcUrl in
-        return try copyFolderToSandbox(srcUrl)
+      let copied = try withSecurityScoped(url: url) { src in
+        try copyFolderToSandbox(src)
+      }
+      ud.set(copied, forKey: kCopiedPath)
+
+      if stale {
+        do {
+          let newData = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+          ud.set(newData.base64EncodedString(), forKey: kBookmark)
+        } catch { }
       }
 
-      ud.set(copied, forKey: kCopiedPath)
-      result(["granted": true, "path": copied])
+      result(["granted": true, "path": copied, "error": NSNull()])
     } catch {
-      result(["granted": false, "path": NSNull()])
+      result(["granted": false, "path": NSNull(), "error": "BOOKMARK_FAIL: \(error)"])
     }
   }
 
-  // MARK: - UIDocumentPickerDelegate
+  private func clearBookmark(_ result: @escaping FlutterResult) {
+    ud.removeObject(forKey: kBookmark)
+    ud.removeObject(forKey: kCopiedPath)
+    result(true)
+  }
 
   func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
     if let r = pendingResult {
       pendingResult = nil
-      r(["granted": false, "path": NSNull(), "bookmark": NSNull()])
+      r(["granted": false, "path": NSNull(), "bookmark": NSNull(), "error": "CANCELLED"])
     }
   }
 
@@ -117,35 +114,29 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
     pendingResult = nil
 
     guard let url = urls.first else {
-      r(["granted": false, "path": NSNull(), "bookmark": NSNull()])
+      r(["granted": false, "path": NSNull(), "bookmark": NSNull(), "error": "NO_URL"])
       return
     }
 
     do {
-      // Create / persist bookmark (so next launch can restore without prompting).
       let bookmarkData = try url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
       let b64 = bookmarkData.base64EncodedString()
       ud.set(b64, forKey: kBookmark)
 
-      // Copy the whole folder into sandbox.
-      let copied = try withSecurityScoped(url: url) { srcUrl in
-        return try copyFolderToSandbox(srcUrl)
+      let copied = try withSecurityScoped(url: url) { src in
+        try copyFolderToSandbox(src)
       }
       ud.set(copied, forKey: kCopiedPath)
 
-      r(["granted": true, "path": copied, "bookmark": b64])
+      r(["granted": true, "path": copied, "bookmark": b64, "error": NSNull()])
     } catch {
-      r(["granted": false, "path": NSNull(), "bookmark": NSNull()])
+      r(["granted": false, "path": NSNull(), "bookmark": NSNull(), "error": "PICK_FAIL: \(error)"])
     }
   }
 
-  // MARK: - Helpers
-
   private func withSecurityScoped<T>(url: URL, _ body: (URL) throws -> T) throws -> T {
     let ok = url.startAccessingSecurityScopedResource()
-    defer {
-      if ok { url.stopAccessingSecurityScopedResource() }
-    }
+    defer { if ok { url.stopAccessingSecurityScopedResource() } }
     return try body(url)
   }
 
@@ -153,11 +144,10 @@ final class FolderAccessPlugin: NSObject, UIDocumentPickerDelegate {
     let fm = FileManager.default
     let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
     let root = support.appendingPathComponent("ImportedPRS1", isDirectory: true)
-    try fm.createDirectory(at: root, withIntermediateDirectories: true)
+    try fm.createDirectory(at: root, withIntermediateDirectories: true, attributes: nil)
 
     let dest = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
 
-    // If somehow exists, remove.
     if fm.fileExists(atPath: dest.path) {
       try fm.removeItem(at: dest)
     }
