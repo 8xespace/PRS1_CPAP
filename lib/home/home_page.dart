@@ -187,7 +187,7 @@ class _HomePageState extends State<HomePage> {
       await _enterComputingPhase(appStateStore);
 
       setState(() {
-        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（PRS1檔案: ${pickedResult.prs1HeadBytesByRelPath.length}）...';
+        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（陽壓治療記錄檔案: ${pickedResult.prs1HeadBytesByRelPath.length}）...';
         _fileCount = pickedResult.allFiles.length;
         _prs1BlobCount = pickedResult.prs1HeadBytesByRelPath.length;
       });// ---------------- Phase 1: Header 準濾 + 35 天 RangeGate (Web) ----------------
@@ -242,7 +242,7 @@ class _HomePageState extends State<HomePage> {
       // Full-read only for allowed files.
       if (mounted) {
         setState(() {
-          _status = 'Phase1 準濾：允許 $allowed / ${headerIndex.entries.length} 檔... 讀取通過 gate 的檔案 bytes 中...';
+          _status = 'Phase1 準濾：允許 $allowed / ${headerIndex.entries.length} 檔... 讀取陽壓治療記錄檔案中...';
         });
       }
 
@@ -252,7 +252,7 @@ class _HomePageState extends State<HomePage> {
         onProgress: (done, total) {
           if (!mounted) return;
           setState(() {
-            _status = '讀取通過 gate 的檔案 bytes 中...（$done / $total）';
+            _status = '讀取陽壓治療記錄檔案中...（$done / $total）';
           });
         },
       );
@@ -371,7 +371,7 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('匯入完成：睡眠場次 ${mergedSessions.length}')),
+          SnackBar(content: Text('匯入完成：陽壓治療次數 ${mergedSessions.length}')),
         );
       }
 
@@ -488,7 +488,7 @@ class _HomePageState extends State<HomePage> {
 
       setState(() {
         _fileCount = allFiles.length;
-        _status = '已取得檔案清單（${allFiles.length}）... 讀取 PRS1 檔案 bytes 中...';
+        _status = '已取得檔案清單（${allFiles.length}）... 讀取陽壓治療記錄檔案中...';
       });
 
       // ---------------- Phase 1: Header 準濾 + 35 天 RangeGate ----------------
@@ -902,7 +902,7 @@ class _HomePageState extends State<HomePage> {
                           children: [
                             Text('狀態：$_status', style: theme.textTheme.bodyMedium),
                             const SizedBox(height: 6),
-                            Text('檔案：$_fileCount、PRS1檔案：$_prs1BlobCount、睡眠場次：${appState.prs1Sessions.length}',
+                            Text('檔案：$_fileCount、呼吸治療檔案：$_prs1BlobCount、陽壓治療次數：${appState.prs1Sessions.length}',
                                 style: theme.textTheme.bodySmall),
                             if (snap != null) ...[
                               const SizedBox(height: 6),

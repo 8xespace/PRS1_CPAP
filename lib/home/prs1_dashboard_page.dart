@@ -739,31 +739,6 @@ class _LowCostChartTileState extends State<_LowCostChartTile> {
     final cs = Theme.of(context).colorScheme;
     final bg = cs.surfaceContainerHighest.withOpacity(0.20);
 
-    Widget header() {
-      return Row(
-        children: [
-          Container(
-            width: 9,
-            height: 9,
-            decoration: BoxDecoration(
-              color: cs.primary.withOpacity(0.85),
-              borderRadius: BorderRadius.circular(99),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              widget.title,
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w900,
-                color: cs.onSurface.withOpacity(0.92),
-              ),
-            ),
-          ),
-        ],
-      );
-    }
 
     Widget skeleton() {
       return Container(
@@ -818,8 +793,8 @@ class _LowCostChartTileState extends State<_LowCostChartTile> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          header(),
-          const SizedBox(height: 10),
+          // NOTE: Per UI spec, remove the auto-generated small section header on each right-side tile.
+          // Each chart widget already renders its own title internally.
           body,
         ],
       ),
