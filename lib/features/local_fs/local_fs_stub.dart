@@ -19,6 +19,10 @@ class LocalFs {
     throw UnsupportedError('Local file system is not available on this platform.');
   }
 
+  static Future<Uint8List> readHead(String absolutePath, int maxBytes) {
+    throw UnsupportedError('Local file system is not available on this platform.');
+  }
+
   static Future<Uint8List> readBytes(String absolutePath) {
     throw UnsupportedError('Local file system is not available on this platform.');
   }

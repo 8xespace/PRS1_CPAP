@@ -10,6 +10,8 @@ import '../features/folder_access/folder_access_service.dart';
 import '../features/folder_access/folder_access_state.dart';
 import '../features/folder_access/platform/folder_access_ios.dart';
 import '../features/prs1/decode/prs1_loader.dart';
+import '../features/prs1/index/prs1_header_index.dart';
+import '../features/prs1/index/prs1_range_gate.dart';
 import '../features/prs1/model/prs1_event.dart';
 import '../features/prs1/model/prs1_session.dart';
 import '../features/prs1/model/prs1_breath.dart';
@@ -35,20 +37,26 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  static const bool _enablePrs1Logs = false; // set true to re-enable debug logs
+
   // Lightweight logger shims (some patches emit logW/logD from within HomePage).
   // Keeping them local avoids adding cross-module dependencies.
   void logW(String msg) {
+    if (!_enablePrs1Logs) return;
     // ignore: avoid_print
     print('[W] $msg');
   }
 
   void logD(String msg) {
+    if (!_enablePrs1Logs) return;
     // ignore: avoid_print
     print('[D] $msg');
   }
 
   final FolderAccessState _folderState = FolderAccessState();
   late final FolderAccessService _folderService;
+
+  final ScrollController _noticeScrollCtrl = ScrollController();
 
   bool _busy = false;
   String _status = '尚未讀取';
@@ -104,7 +112,8 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _folderState.dispose();
-    super.dispose();
+    super.dispose();    _noticeScrollCtrl.dispose();
+
   }
 
   bool _isPrs1Candidate(String pathLower) {
@@ -149,15 +158,15 @@ class _HomePageState extends State<HomePage> {
     appStateStore.setEnginePhase(EnginePhase.scanning, message: '讀取資料中...');
 
     try {
-      WebPickedFolderResult? picked;
-      picked = await WebImport.pickFolderAndReadPrs1(
+      final WebPickedFolderResult? picked = await WebImport.pickFolderAndReadPrs1Heads(
         isPrs1Candidate: _isPrs1Candidate,
-        onProgress: (scanned, total, prs1Read) {
+        headMaxBytes: 512,
+        onProgress: (scanned, total, prs1HeadsRead) {
           if (!mounted) return;
           setState(() {
             _scanDone = scanned;
             _scanTotal = total;
-            _status = '讀取中...（檔案 $total / PRS1檔案 $prs1Read）';
+            _status = '讀取中...（檔案 $total / PRS1頭部 $prs1HeadsRead）';
           });
         },
       );
@@ -178,16 +187,89 @@ class _HomePageState extends State<HomePage> {
       await _enterComputingPhase(appStateStore);
 
       setState(() {
-        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（PRS1檔案: ${pickedResult.prs1BytesByRelPath.length}）...';
+        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（PRS1檔案: ${pickedResult.prs1HeadBytesByRelPath.length}）...';
         _fileCount = pickedResult.allFiles.length;
-        _prs1BlobCount = pickedResult.prs1BytesByRelPath.length;
-      });
+        _prs1BlobCount = pickedResult.prs1HeadBytesByRelPath.length;
+      });// ---------------- Phase 1: Header 準濾 + 35 天 RangeGate (Web) ----------------
+      // Web 必須避免「先把整張 SD 的所有 PRS1 檔案完整讀入記憶體」。
+      // 因此流程改為：
+      //  1) 先讀每個候選檔的 head(0..N) -> 建 HeaderIndex
+      //  2) 推導 lastUsedDate -> 建 35 天 RangeGate
+      //  3) 只對通過 gate 的檔案做 full read -> 才進 full decode
+
+      final sizeByRel = <String, int>{};
+      for (final meta in pickedResult.allFiles) {
+        sizeByRel[meta.relativePath] = meta.sizeBytes;
+      }
+
+      final headerIndex = Prs1HeaderIndex.buildFromHeads(
+        headBytesByRelPath: pickedResult.prs1HeadBytesByRelPath,
+        sizeBytesByRelPath: sizeByRel,
+      );
+
+      DateTime lastUsed = headerIndex.lastUsedDateLocal ?? DateTime.now();
+      if (headerIndex.lastUsedDateLocal == null) {
+        logW('PRS1 Phase1(Web): lastUsedDate 推導失敗（無可用 header timestamp）；暫以 now 作為 lastUsedDate，並保守允許所有檔案。');
+      }
+
+      final gate = Prs1RangeGate(
+        allowedStart: lastUsed.subtract(const Duration(days: 35)),
+        allowedEnd: lastUsed,
+      );
+
+      int allowed = 0;
+      int skipped = 0;
+      final allowedRel = <String>{};
+
+      for (final e in headerIndex.entries) {
+        final t = e.timestampLocal;
+        final ok = (t == null) ? true : gate.isAllowed(t);
+        if (ok) {
+          allowedRel.add(e.relativePath);
+          allowed++;
+        } else {
+          skipped++;
+        }
+      }
+
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] lastUsedDate=$lastUsed');
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] allowedStart=${gate.allowedStart} allowedEnd=${gate.allowedEnd}');
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] allowedFiles=$allowed skippedFiles=$skipped (unknownTimestamp treated as allowed)');
+
+      // Full-read only for allowed files.
+      if (mounted) {
+        setState(() {
+          _status = 'Phase1 準濾：允許 $allowed / ${headerIndex.entries.length} 檔... 讀取通過 gate 的檔案 bytes 中...';
+        });
+      }
+
+      final filteredPrs1Bytes = await WebImport.readFullBytesFor(
+        handle: pickedResult.handle,
+        relativePaths: allowedRel,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(() {
+            _status = '讀取通過 gate 的檔案 bytes 中...（$done / $total）';
+          });
+        },
+      );
+
+      if (mounted) {
+        setState(() {
+          _prs1BlobCount = filteredPrs1Bytes.length;
+          _status = 'Phase1 準濾：允許 ${filteredPrs1Bytes.length} 檔，開始解析...';
+        });
+      }
+
 
       final loader = Prs1Loader();
       final sessions = <Prs1Session>[];
 
       int _prs1ParseFailures = 0;
-      for (final e in pickedResult.prs1BytesByRelPath.entries) {
+      for (final e in filteredPrs1Bytes.entries) {
         try {
           final res = loader.parse(e.value, sourcePath: e.key);
           if (res.sessions.isNotEmpty) sessions.addAll(res.sessions);
@@ -206,6 +288,17 @@ class _HomePageState extends State<HomePage> {
       final mergedSessions = _mergePrs1Sessions(sessions);
 
       mergedSessions.sort((a, b) => b.start.compareTo(a.start));
+
+      if (mergedSessions.isNotEmpty) {
+        final newestS = mergedSessions.first.start;
+        final oldestS = mergedSessions.last.start;
+        final spanDays = newestS.difference(oldestS).inDays + 1;
+        // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1][Web] sessions spanDays=$spanDays (newest=$newestS oldest=$oldestS)');
+      } else {
+        // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1][Web] sessions=0');
+      }
 
       // Web「資訊流控制」：避免一次對整張 SD 進行全量 detail 建索引而卡死。
       // 解析 sessions（summary）仍保留全量；但 detail（indices/buckets）僅先建立「最近 N 天」，
@@ -248,7 +341,7 @@ class _HomePageState extends State<HomePage> {
       final snapshot = CpapImportSnapshot(
         folderPath: 'web-folder:${pickedResult.displayName}',
         allFiles: allFiles,
-        prs1BytesByRelPath: pickedResult.prs1BytesByRelPath,
+        prs1BytesByRelPath: filteredPrs1Bytes,
       );
 
       final appState = appStateStore;
@@ -375,7 +468,7 @@ class _HomePageState extends State<HomePage> {
         _status = '掃描檔案中...';
       });
 
-            final entries = await LocalFs.listFilesRecursive(folderPath);
+      final entries = await LocalFs.listFilesRecursive(folderPath);
 
       final allFiles = <CpapImportedFile>[];
       final prs1Bytes = <String, Uint8List>{};
@@ -398,10 +491,73 @@ class _HomePageState extends State<HomePage> {
         _status = '已取得檔案清單（${allFiles.length}）... 讀取 PRS1 檔案 bytes 中...';
       });
 
-      // 只把 PRS1 候選檔讀進記憶體（避免整張卡全部吃進來）
+      // ---------------- Phase 1: Header 準濾 + 35 天 RangeGate ----------------
+      // 1) 先只讀取每個 PRS1 候選檔的前段 header（小於 1KB），建立 HeaderIndex。
+      // 2) 推導 lastUsedDate。
+      // 3) 建立 RangeGate(35 days)，並且「只讀入」允許範圍內的檔案 bytes。
+
+      const int _headerMaxBytes = 512; // EDF header needs 184+, PRS1 chunk needs 15+.
+
+      final Map<String, Uint8List> heads = <String, Uint8List>{};
+      final Map<String, int> sizeByRel = <String, int>{};
+
       for (final f in allFiles) {
         final pl = f.relativePath.toLowerCase();
         if (!_isPrs1Candidate(pl)) continue;
+        sizeByRel[f.relativePath] = f.sizeBytes;
+        // Head-only read (Phase 1)
+        final head = await LocalFs.readHead(f.absolutePath, _headerMaxBytes);
+        heads[f.relativePath] = head;
+      }
+
+      final headerIndex = Prs1HeaderIndex.buildFromHeads(
+        headBytesByRelPath: heads,
+        sizeBytesByRelPath: sizeByRel,
+      );
+
+      DateTime lastUsed =
+          headerIndex.lastUsedDateLocal ?? DateTime.now();
+      if (headerIndex.lastUsedDateLocal == null) {
+        logW('PRS1 Phase1: lastUsedDate 推導失敗（無可用 header timestamp）；暫以 now 作為 lastUsedDate，並保守允許所有檔案。');
+      }
+
+      final gate = Prs1RangeGate(
+        allowedStart: lastUsed.subtract(const Duration(days: 35)),
+        allowedEnd: lastUsed,
+      );
+
+      int allowed = 0;
+      int skipped = 0;
+      final allowedRel = <String>{};
+
+      for (final e in headerIndex.entries) {
+        final t = e.timestampLocal;
+        // Strict when timestamp is known; conservative allow when unknown.
+        final ok = (t == null) ? true : gate.isAllowed(t);
+        if (ok) {
+          allowedRel.add(e.relativePath);
+          allowed++;
+        } else {
+          skipped++;
+        }
+      }
+
+      // Web Debug 檢核點：console 印出
+      // - lastUsedDate
+      // - allowed start/end
+      // - skipped / allowed counts
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] lastUsedDate=$lastUsed');
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] allowedStart=${gate.allowedStart} allowedEnd=${gate.allowedEnd}');
+      // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] allowedFiles=$allowed skippedFiles=$skipped (unknownTimestamp treated as allowed)');
+
+      // 只把「允許範圍內」的 PRS1 檔讀進記憶體（避免整張卡全部吃進來）
+      for (final f in allFiles) {
+        final pl = f.relativePath.toLowerCase();
+        if (!_isPrs1Candidate(pl)) continue;
+        if (!allowedRel.contains(f.relativePath)) continue;
         final bytes = await LocalFs.readBytes(f.absolutePath);
         prs1Bytes[f.relativePath] = Uint8List.fromList(bytes);
       }
@@ -427,6 +583,17 @@ class _HomePageState extends State<HomePage> {
 
       final mergedSessions = _mergePrs1Sessions(sessions);
       mergedSessions.sort((a, b) => b.start.compareTo(a.start));
+
+      if (mergedSessions.isNotEmpty) {
+        final newestS = mergedSessions.first.start;
+        final oldestS = mergedSessions.last.start;
+        final spanDays = newestS.difference(oldestS).inDays + 1;
+        // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1] sessions spanDays=$spanDays (newest=$newestS oldest=$oldestS)');
+      } else {
+        // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1] sessions=0');
+      }
 
       // Web「資訊流控制」：避免一次對整張 SD 進行全量 detail 建索引而卡死。
       // 解析 sessions（summary）仍保留全量；但 detail（indices/buckets）僅先建立「最近 N 天」，
@@ -805,8 +972,10 @@ class _HomePageState extends State<HomePage> {
                             child: ClipRRect(
                               borderRadius: BorderRadius.circular(14),
                               child: Scrollbar(
+                                controller: _noticeScrollCtrl,
                                 thumbVisibility: true,
                                 child: SingleChildScrollView(
+                                  controller: _noticeScrollCtrl,
                                   padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
                                   child: Text(
                                     noticeText,

@@ -132,8 +132,22 @@ L. prs1_chart_pressure_time.dart（壓力時間）
 
 睡到寶
 
-01. 解析兩個壓縮檔當中的內容。
-02. 推理進到 XCode 能不能順利輸出 APP.ipa
-03. 分析完畢給我修改意見或是檔案調整的提供等等。
-
-教我整合
+00. 整體系統的記憶體優化的環境升級，繼續做改進和提升。
+01. 在 WEB 環境當中採用以下這個方式，來做檔案載入前的提取篩檢( lib.zip )：
+  a. 只讀每個檔案的「前 N bytes」抽 header timestamp（不做完整解碼）
+  b. 在 PRS1 的關鍵時間戳，每個檔案的固定 header 區(前 64~512 bytes 內可拿到)
+  c. 取得資料夾內的列出檔案清單
+  d. 對每個檔案只 read(0..N)（例如 512 或 2048 bytes）
+  e. 嘗試解析出「該檔案最早/最晚 timestamp」或「session date」
+  f. 用這個 timestamp 做 35 天 gate
+  g. 只有通過 gate 的檔案才進一步 full decode
+02. 在 iOS 環境當中的策略，採用在 Swift 端「只複製 35 天內的檔案」到 sandbox( 檔案在ios.zip )
+  a. 改在 Swift enumerate 時就先做 gate 設定
+  b. 用 FileManager 取得每個檔案 modificationDate
+  c. 或者對檔案開 FileHandle 讀前 N bytes 做 HeaderProbe（更準）
+  d. 只 copy 符合 cutoff 的檔案
+  e. Flutter 端只會看到「已被過濾後」的小資料夾 → 掃描/解析自然就快
+  f. 重新改寫和優化 FolderAccessPlugin 的 swift 檔案。
+03. 檢核點必須要在 WEB 可以順利執行，之後進到 XCode 也要能夠啟用這個機制。
+04. 務必仔細推理找出最佳化的檔案提取篩檢確認。
+05. 完成開發和功能檢核之後，撰寫修改之後，給我完整下載連結。

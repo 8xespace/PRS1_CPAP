@@ -2,6 +2,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import '../app_state.dart';
 import '../features/prs1/aggregate/prs1_daily_models.dart';
+import '../features/prs1/model/prs1_session.dart';
 import '../features/prs1/model/prs1_waveform_channel.dart';
 import '../features/prs1/stats/prs1_rolling_metrics.dart';
 import 'charts/prs1_chart_events.dart';
@@ -35,6 +36,23 @@ Color _readableOn(Color bg) {
   return bg.computeLuminance() > 0.55 ? Colors.black : Colors.white;
 }
 
+/// Phase 4：右側圖表序列載入的 key（順序固定）。
+enum _ChartKey {
+  events,
+  flowRate,
+  crossAnalysis,
+  pressure,
+  leakRate,
+  tidalVolume,
+  respRate,
+  minuteVent,
+  snore,
+  inspTime,
+  expTime,
+  ahi,
+  pressureTime,
+}
+
 
 /// 單列統計資料（對齊 OSCAR：最小 / 中間值 / 95% / 最大）
 class _StatRow {
@@ -57,13 +75,12 @@ class _StatRow {
 
 /// 給一般使用者看的「核心指標」：整晚 AHI（與 OSCAR Daily AHI 對齊）。
 class _AhiBanner extends StatelessWidget {
-  const _AhiBanner({required this.ahi});
+  const _AhiBanner({required this.ahi, this.onTap});
 
   final double? ahi;
+  final VoidCallback? onTap;
 
   @override
-
-@override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final v = ahi;
@@ -74,7 +91,7 @@ class _AhiBanner extends StatelessWidget {
     final bg = _deepen(appState.brandColor.color, brightness: cs.brightness);
     final fg = _readableOn(bg);
 
-    return Container(
+    final content = Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
         color: bg,
@@ -99,6 +116,18 @@ class _AhiBanner extends StatelessWidget {
         ),
       ),
     );
+
+    if (onTap == null) return content;
+
+    // Phase 3：AHI 變按鈕（點擊後展開右側區域）。
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: content,
+      ),
+    );
   }
 }
 
@@ -110,9 +139,30 @@ class Prs1DashboardPage extends StatefulWidget {
 }
 
 class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
-  final ScrollController _rightChartsCtrl = ScrollController();
+  static const bool kPrs1UiLogs = false; // set true to re-enable Phase4/5 debugPrint logs
+  late ScrollController _rightChartsCtrl;
+  Key _rightChartsListKey = UniqueKey();
 
-  ColorScheme get scheme => Theme.of(context).colorScheme;
+  // Phase 4：右側圖表序列載入（按 AHI 後才開始），並支援 cancel。
+  bool _showRight = false;
+  final List<_ChartKey> _loadedCharts = <_ChartKey>[];
+  int _queueToken = 0;
+  DateTime? _queueDay;
+
+  
+  @override
+  void initState() {
+    super.initState();
+    _rightChartsCtrl = ScrollController();
+  }
+
+  @override
+  void dispose() {
+    _rightChartsCtrl.dispose();
+    super.dispose();
+  }
+
+ColorScheme get scheme => Theme.of(context).colorScheme;
 
   int _selectedIndex = 0; // index into last7
   bool _didInitSelection = false;
@@ -123,6 +173,7 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
         _weekOffset -= 1;
         _selectedIndex = 0;
         _didInitSelection = false;
+        _hardClearWorkingSet('date/window changed');
       });
     }
   }
@@ -133,7 +184,226 @@ class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
         _weekOffset += 1;
         _selectedIndex = 0;
         _didInitSelection = false;
+        _hardClearWorkingSet('date/window changed');
       });
+    }
+  }
+
+  
+  void _hardClearWorkingSet(String reason) {
+    // Phase 5：記憶體釋放保證（偏硬控制）：
+    // - 右側只保留「目前選日」，一換日就全部丟掉重算。
+    // - 取消載入隊列、清空右側 charts、重建 ScrollController 以釋放 ScrollPosition/clients。
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase5] clear working set: $reason');
+
+    // cancel queue + clear right
+    _queueToken++;
+    _queueDay = null;
+    _loadedCharts.clear();
+    _showRight = false;
+
+    // Recreate controller AFTER this frame to avoid disposing an attached controller.
+    final old = _rightChartsCtrl;
+    _rightChartsCtrl = ScrollController();
+    _rightChartsListKey = UniqueKey();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        old.dispose();
+      } catch (_) {}
+      if (kPrs1UiLogs) debugPrint('[PRS1][Phase5] controllers disposed/recreated; right cleared.');
+    });
+  }
+
+void _cancelRight({required bool resetShowRight}) {
+
+    _queueToken++;
+    _queueDay = null;
+    _loadedCharts.clear();
+    _rightChartsListKey = UniqueKey();
+    if (resetShowRight) {
+      _showRight = false;
+    }
+    // 確保回到頂部，避免下一次載入從中段開始。
+    if (_rightChartsCtrl.hasClients) {
+      try {
+        _rightChartsCtrl.jumpTo(0);
+      } catch (_) {}
+    }
+
+  }
+
+  Future<void> _startChartQueueForDay(DateTime day) async {
+    // 先 cancel 舊任務與清空右側，但保留 showRight=true（讓右側區域立刻存在）。
+    _queueToken++;
+    final myToken = _queueToken;
+    _queueDay = day;
+    _loadedCharts.clear();
+    _rightChartsListKey = UniqueKey();
+    _showRight = true;
+
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] start ChartLoadQueue day=$day');
+
+    // 逐張載入：每張完成就更新 UI。
+    for (final k in _ChartKey.values) {
+      if (!mounted) return;
+      if (myToken != _queueToken) {
+        if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue cancelled (token changed)');
+        return;
+      }
+      if (_queueDay != day) {
+        if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue cancelled (day changed)');
+        return;
+      }
+
+      setState(() {
+        _loadedCharts.add(k);
+      });
+
+      // 小間隔讓使用者看起來像「逐張出現」，同時避免一次性建構造成尖峰。
+      await Future.delayed(const Duration(milliseconds: 70));
+    }
+
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue finished ($day)');
+  }
+
+  String _chartTitle(_ChartKey k) {
+    switch (k) {
+      case _ChartKey.events:
+        return '事件標記';
+      case _ChartKey.flowRate:
+        return '氣流速率';
+      case _ChartKey.crossAnalysis:
+        return '交叉分析圖';
+      case _ChartKey.pressure:
+        return '壓力';
+      case _ChartKey.leakRate:
+        return '漏氣率';
+      case _ChartKey.tidalVolume:
+        return '呼吸容量';
+      case _ChartKey.respRate:
+        return '呼吸速率';
+      case _ChartKey.minuteVent:
+        return '分鐘通氣率';
+      case _ChartKey.snore:
+        return '打鼾';
+      case _ChartKey.inspTime:
+        return '吸氣時間';
+      case _ChartKey.expTime:
+        return '吐氣時間';
+      case _ChartKey.ahi:
+        return '呼吸中止指數 AHI';
+      case _ChartKey.pressureTime:
+        return '壓力時間';
+    }
+  }
+
+  Widget _buildChartByKey(
+    _ChartKey k, {
+    required DateTime? sessionStart,
+    required DateTime? sessionEnd,
+    required List<Prs1Session> sessions,
+    required Prs1DailyBucket bucket,
+  }) {
+    // 若缺少 session window，回傳提示（仍然算「逐張出現」）。
+    if (sessionStart == null || sessionEnd == null) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: scheme.surfaceContainerHighest.withOpacity(0.35),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: scheme.outlineVariant),
+        ),
+        child: Text(
+          '${_chartTitle(k)}：本日資料缺少 session 起訖時間（尚未建立 slices / session window）',
+          style: TextStyle(
+            color: scheme.onSurface.withOpacity(0.75),
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      );
+    }
+
+    switch (k) {
+      case _ChartKey.events:
+        return Prs1ChartEvents(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          events: Prs1EventDeriver.derive(decodedEvents: bucket.events),
+        );
+      case _ChartKey.flowRate:
+        return Prs1ChartFlowRate(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          sessions: sessions,
+        );
+      case _ChartKey.crossAnalysis:
+        return Prs1ChartCrossAnalysis(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.pressure:
+        return Prs1ChartPressure(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          sessions: sessions,
+        );
+      case _ChartKey.leakRate:
+        return Prs1ChartLeakRate(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.tidalVolume:
+        return Prs1ChartTidalVolume(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.respRate:
+        return Prs1ChartRespRate(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.minuteVent:
+        return Prs1ChartMinuteVent(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.snore:
+        return Prs1ChartSnore(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.inspTime:
+        return Prs1ChartInspTime(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.expTime:
+        return Prs1ChartExpTime(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.ahi:
+        return Prs1ChartAhi(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
+      case _ChartKey.pressureTime:
+        return Prs1ChartPressureTime(
+          sessionStart: sessionStart,
+          sessionEnd: sessionEnd,
+          bucket: bucket,
+        );
     }
   }
 
@@ -255,35 +525,119 @@ final snoreStats = _statsOfValues(snoreSeries);
             // 統計區（左欄）不要再縮小：避免 iPad/桌面下可讀性崩壞。
             const double minLeftWidth = 430;
 
-            // 右側圖表欄最大只到「放大 200%」(也就是右=左*2)。
-            // 超過的寬度不再繼續擴張，維持在合理閱讀範圍內。
+            // Phase 4：右側圖表序列載入（按 AHI 後才開始），並逐張出現。
+            // 重要：在 _showRight=false 時，右側 widget 完全不建立。
+            Widget _rightPanel() {
+              final cs = Theme.of(context).colorScheme;
+              final bg = cs.surfaceContainerHighest.withOpacity(0.20);
 
+              final total = _ChartKey.values.length;
+              final done = _loadedCharts.length;
+
+              Widget tileHeader(String title, {String? subtitle}) {
+                return Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 10),
+                  decoration: BoxDecoration(
+                    color: bg,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: cs.outlineVariant.withOpacity(0.75)),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        title,
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w900,
+                          color: cs.onSurface.withOpacity(0.92),
+                        ),
+                      ),
+                      if (subtitle != null) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          subtitle,
+                          style: TextStyle(
+                            fontSize: 13,
+                            height: 1.25,
+                            color: cs.onSurface.withOpacity(0.72),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                );
+              }
+
+              return Padding(
+                padding: const EdgeInsets.fromLTRB(0, 12, 12, 12),
+                child: Scrollbar(
+                  controller: _rightChartsCtrl,
+                  thumbVisibility: true,
+                  child: ListView(
+                    key: _rightChartsListKey,
+                    controller: _rightChartsCtrl,
+                    children: [
+                      for (final k in _loadedCharts) ...[
+                        _LowCostChartTile(
+                          title: _chartTitle(k),
+                          // Phase 6：延遲 build，並用 ClipRect/Align 做一次性揭露動畫。
+                          buildChart: () => _buildChartByKey(
+                            k,
+                            sessionStart: sessionStart,
+                            sessionEnd: sessionEnd,
+                            sessions: sessions,
+                            bucket: b,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                      ],
+                      if (done < total)
+                        tileHeader('下一張：${_chartTitle(_ChartKey.values[done])}'),
+                    ],
+                  ),
+                ),
+              );
+            }
+
+            // 左側（週柱狀圖 + AHI Banner + 統計表格）
+            // Phase 2 重點：即使是寬螢幕（iPad/桌面），也只 render 這個左側，右側完全不建立。
             final leftPanel = ConstrainedBox(
               constraints: const BoxConstraints(minWidth: minLeftWidth),
               child: Padding(
-                padding: const EdgeInsets.fromLTRB(16, 16, 16, 16),
+                padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
                 child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
-                    // 上方柱狀圖固定，不跟著下方統計表一起滾動。
-                                        _WeekCard(
+                    _WeekCard(
                       buckets: last7,
                       selectedIndex: _selectedIndex,
                       onSelect: (i) {
                         setState(() {
                           _selectedIndex = i;
-                          _didInitSelection = true;
+                          _hardClearWorkingSet('date/window changed');
                         });
                       },
                       weekOffset: _weekOffset,
-                      onPrevWeek: (_weekOffset > -maxBackWeeks) ? () => _prevWeek(maxBackWeeks) : null,
-                      onNextWeek: (_weekOffset < 0) ? _nextWeek : null,
+                      onPrevWeek: _weekOffset > -maxBackWeeks ? () => _prevWeek(maxBackWeeks) : null,
+                      onNextWeek: _weekOffset < 0 ? _nextWeek : null,
                     ),
-                    const SizedBox(height: 14),
-                    // 一般用戶最直覺關心的核心指標：整晚 AHI（與 OSCAR 對齊）。
-                    _AhiBanner(ahi: nightlyAhi),
-                    const SizedBox(height: 14),
-                    // 下方統計資料框獨立滾動（並凍結欄位標題列）。
+                    const SizedBox(height: 12),
+                    _AhiBanner(
+                      ahi: nightlyAhi,
+                      onTap: () {
+                        if (!isWide) return;
+                        // Phase 4：開始序列載入右側圖表（按指定順序逐張出現）。
+                        if (_showRight && _queueDay == b.day) return;
+                        setState(() {
+                          // 先把右側開起來，並清空舊狀態。
+                          _cancelRight(resetShowRight: false);
+                          _showRight = true;
+                        });
+                        _startChartQueueForDay(b.day);
+                      },
+                    ),
+                    const SizedBox(height: 12),
                     Expanded(
                       child: _StatsPanel(
                         dateLabel: ymdLabel,
@@ -298,155 +652,32 @@ final snoreStats = _statsOfValues(snoreSeries);
               ),
             );
 
-            // 右側圖表（目前只先接第一張：事件標記）
-            final rightPanelWithCharts = Padding(
-              padding: const EdgeInsets.fromLTRB(0, 16, 16, 16),
-              child: Scrollbar(
-                controller: _rightChartsCtrl,
-                thumbVisibility: true,
-                child: ListView(
-                  controller: _rightChartsCtrl,
-                  children: [
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartEvents(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        events: Prs1EventDeriver.derive(decodedEvents: b.events),
-                      )
-                    else
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(12),
-                        decoration: BoxDecoration(
-                          color: scheme.surfaceContainerHighest.withOpacity(0.35),
-                          borderRadius: BorderRadius.circular(12),
-                          border: Border.all(color: scheme.outlineVariant),
-                        ),
-                        child: Text(
-                          '事件標記：本日資料缺少 session 起訖時間（尚未建立 slices / session window）',
-                          style: TextStyle(
-                            color: scheme.onSurface.withOpacity(0.75),
-                            fontSize: 13,
-                            fontWeight: FontWeight.w600,
-                          ),
-                        ),
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartFlowRate(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        sessions: sessions,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartCrossAnalysis(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartPressure(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        sessions: sessions,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartLeakRate(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartSnore(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartTidalVolume(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartRespRate(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartMinuteVent(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartInspTime(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartExpTime(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartAhi(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                    const SizedBox(height: 12),
-                    if (sessionStart != null && sessionEnd != null)
-                      Prs1ChartPressureTime(
-                        sessionStart: sessionStart,
-                        sessionEnd: sessionEnd,
-                        bucket: b,
-                      ),
-                  ],
-                ),
-              ),
-            );
-
             if (isWide) {
-              final totalW = constraints.maxWidth;
+              // Phase 4：起始只 render 左側；按下 AHI 後，左側以「迅速」動畫縮到固定寬度，右側逐張載入。
+              if (!_showRight) return leftPanel;
 
-              // 先保住左欄最小寬度；剩餘寬度給右欄，但右欄最多 = 左欄 * 2（200%）。
-              final leftW = math.min(
-                math.max(minLeftWidth, totalW / 3.0),
-                totalW,
-              );
-              final rightW = math.min(
-                math.max(0.0, totalW - leftW),
-                leftW * 2.0,
-              );
-              final unused = math.max(0.0, totalW - leftW - rightW);
+              final totalW = constraints.maxWidth;
+              const minRightW = 360.0;
+              final leftFromW = math.max(minLeftWidth, totalW - minRightW);
 
               return Row(
                 children: [
-                  SizedBox(width: leftW, child: leftPanel),
-                  SizedBox(width: rightW, child: rightPanelWithCharts),
-                  if (unused > 0) SizedBox(width: unused),
+                  TweenAnimationBuilder<double>(
+                    tween: Tween<double>(begin: leftFromW, end: minLeftWidth),
+                    duration: const Duration(milliseconds: 240),
+                    curve: Curves.fastOutSlowIn,
+                    builder: (context, w, child) => SizedBox(width: w, child: child),
+                    child: leftPanel,
+                  ),
+                  Expanded(child: _rightPanel()),
                 ],
               );
             }
 
-            // iPhone / 窄螢幕：僅顯示左側統計（iPad 才顯示完整右側圖表）
+            // 窄螢幕：僅顯示左側統計
             return leftPanel;
 
-            },
+          },
         ),
       ),
     );
@@ -456,6 +687,143 @@ final snoreStats = _statsOfValues(snoreSeries);
     if (sorted.isEmpty) return const [];
     final start = math.max(0, sorted.length - 7);
     return sorted.sublist(start);
+  }
+}
+
+/// Phase 6：低成本視覺特效（不複製 samples、不建立第二份 Path/點列）
+///
+/// 作法：
+/// 1) 先顯示 skeleton / 標題（幾乎不吃記憶體）
+/// 2) 延遲一小段時間後才真正 build chart widget
+/// 3) 用 ClipRect + Align(heightFactor) 做一次性的「揭露」動畫（不產生裁切後的新 samples list）
+class _LowCostChartTile extends StatefulWidget {
+  const _LowCostChartTile({
+    required this.title,
+    required this.buildChart,
+    this.preDelay = const Duration(milliseconds: 40),
+    this.revealDuration = const Duration(milliseconds: 220),
+  });
+
+  final String title;
+  final Widget Function() buildChart;
+  final Duration preDelay;
+  final Duration revealDuration;
+
+  @override
+  State<_LowCostChartTile> createState() => _LowCostChartTileState();
+}
+
+class _LowCostChartTileState extends State<_LowCostChartTile> {
+  int _stage = 0; // 0=skeleton, 1=ready (still skeleton), 2=build+reveal
+  Widget? _built;
+
+  @override
+  void initState() {
+    super.initState();
+    // 先讓 ListView 佈局穩定，再延遲建構圖表（避免一次性尖峰）。
+    Future.delayed(const Duration(milliseconds: 10), () {
+      if (!mounted) return;
+      setState(() => _stage = 1);
+    });
+    Future.delayed(widget.preDelay, () {
+      if (!mounted) return;
+      setState(() {
+        _stage = 2;
+        _built ??= widget.buildChart();
+      });
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final bg = cs.surfaceContainerHighest.withOpacity(0.20);
+
+    Widget header() {
+      return Row(
+        children: [
+          Container(
+            width: 9,
+            height: 9,
+            decoration: BoxDecoration(
+              color: cs.primary.withOpacity(0.85),
+              borderRadius: BorderRadius.circular(99),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              widget.title,
+              style: TextStyle(
+                fontSize: 15,
+                fontWeight: FontWeight.w900,
+                color: cs.onSurface.withOpacity(0.92),
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    Widget skeleton() {
+      return Container(
+        width: double.infinity,
+        height: 160,
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerHighest.withOpacity(0.35),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: cs.outlineVariant.withOpacity(0.75)),
+        ),
+        alignment: Alignment.center,
+        child: Text(
+          _stage == 0 ? '準備中…' : '繪製中…',
+          style: TextStyle(
+            color: cs.onSurface.withOpacity(0.70),
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      );
+    }
+
+    Widget body;
+    if (_stage < 2 || _built == null) {
+      body = skeleton();
+    } else {
+      final child = _built!;
+      body = TweenAnimationBuilder<double>(
+        tween: Tween<double>(begin: 0.0, end: 1.0),
+        duration: widget.revealDuration,
+        curve: Curves.easeOutCubic,
+        builder: (context, t, _) {
+          return ClipRect(
+            child: Align(
+              alignment: Alignment.topCenter,
+              heightFactor: t,
+              child: child,
+            ),
+          );
+        },
+      );
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: cs.outlineVariant.withOpacity(0.75)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          header(),
+          const SizedBox(height: 10),
+          body,
+        ],
+      ),
+    );
   }
 }
 
