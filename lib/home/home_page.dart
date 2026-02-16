@@ -75,7 +75,7 @@ class _HomePageState extends State<HomePage> {
     _computingSince = DateTime.now();
     appState.setEnginePhase(
       EnginePhase.computing,
-      message: '統計引擎運作中，請不要關閉本軟體',
+      message: '統計引擎開始運作，請不要關閉本應用程式',
     );
     // Yield one frame so the hint can paint before heavy synchronous work starts.
     await Future<void>.delayed(const Duration(milliseconds: 40));
@@ -166,7 +166,7 @@ class _HomePageState extends State<HomePage> {
           setState(() {
             _scanDone = scanned;
             _scanTotal = total;
-            _status = '讀取中...（檔案 $total / PRS1頭部 $prs1HeadsRead）';
+            _status = '讀取中...（檔案 $total / 陽壓治療檔案 $prs1HeadsRead）';
           });
         },
       );
@@ -565,7 +565,7 @@ class _HomePageState extends State<HomePage> {
 
       setState(() {
         _prs1BlobCount = prs1Bytes.length;
-        _status = '開始解析（PRS1檔案: ${prs1Bytes.length}）...';
+        _status = '開始解析（陽壓治療檔案: ${prs1Bytes.length}）...';
       });
 
       await _enterComputingPhase(appStateStore);
@@ -729,8 +729,8 @@ class _HomePageState extends State<HomePage> {
                     children: [
                       Text(
                         '01. 請點擊「讀取記憶卡」，將位置指向陽壓呼吸器的記憶卡或是裝置中的指定目錄。\n'
-                        '02. 讀取完整檔案、進入統計引擎皆需要相當的運作時間，敬請您耐心等候。\n'
-                        '03. 本應用程式僅支援 Philips DreamStation 系列陽壓呼吸治療器檔案規格。',
+                        '02. 讀取完整睡眠紀錄檔案、進入統計引擎分析運作皆需要相當的時間，敬請您耐心等候。\n'
+                        '03. 本應用程式僅支援 Philips DreamStation 系列陽壓呼吸治療器檔案格式。',
                         style: theme.textTheme.bodyMedium,
                       ),
                       const SizedBox(height: 14),

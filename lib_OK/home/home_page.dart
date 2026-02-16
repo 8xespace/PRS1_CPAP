@@ -37,14 +37,18 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
+  static const bool _enablePrs1Logs = false; // set true to re-enable debug logs
+
   // Lightweight logger shims (some patches emit logW/logD from within HomePage).
   // Keeping them local avoids adding cross-module dependencies.
   void logW(String msg) {
+    if (!_enablePrs1Logs) return;
     // ignore: avoid_print
     print('[W] $msg');
   }
 
   void logD(String msg) {
+    if (!_enablePrs1Logs) return;
     // ignore: avoid_print
     print('[D] $msg');
   }
@@ -71,7 +75,7 @@ class _HomePageState extends State<HomePage> {
     _computingSince = DateTime.now();
     appState.setEnginePhase(
       EnginePhase.computing,
-      message: '統計引擎運作中，請不要關閉本軟體',
+      message: '統計引擎開始運作，請不要關閉本應用程式',
     );
     // Yield one frame so the hint can paint before heavy synchronous work starts.
     await Future<void>.delayed(const Duration(milliseconds: 40));
@@ -154,15 +158,15 @@ class _HomePageState extends State<HomePage> {
     appStateStore.setEnginePhase(EnginePhase.scanning, message: '讀取資料中...');
 
     try {
-      WebPickedFolderResult? picked;
-      picked = await WebImport.pickFolderAndReadPrs1(
+      final WebPickedFolderResult? picked = await WebImport.pickFolderAndReadPrs1Heads(
         isPrs1Candidate: _isPrs1Candidate,
-        onProgress: (scanned, total, prs1Read) {
+        headMaxBytes: 512,
+        onProgress: (scanned, total, prs1HeadsRead) {
           if (!mounted) return;
           setState(() {
             _scanDone = scanned;
             _scanTotal = total;
-            _status = '讀取中...（檔案 $total / PRS1檔案 $prs1Read）';
+            _status = '讀取中...（檔案 $total / 陽壓治療檔案 $prs1HeadsRead）';
           });
         },
       );
@@ -183,31 +187,31 @@ class _HomePageState extends State<HomePage> {
       await _enterComputingPhase(appStateStore);
 
       setState(() {
-        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（PRS1檔案: ${pickedResult.prs1BytesByRelPath.length}）...';
+        _status = '已取得檔案清單（${pickedResult.allFiles.length}）... 開始解析（陽壓治療記錄檔案: ${pickedResult.prs1HeadBytesByRelPath.length}）...';
         _fileCount = pickedResult.allFiles.length;
-        _prs1BlobCount = pickedResult.prs1BytesByRelPath.length;
-      });
+        _prs1BlobCount = pickedResult.prs1HeadBytesByRelPath.length;
+      });// ---------------- Phase 1: Header 準濾 + 35 天 RangeGate (Web) ----------------
+      // Web 必須避免「先把整張 SD 的所有 PRS1 檔案完整讀入記憶體」。
+      // 因此流程改為：
+      //  1) 先讀每個候選檔的 head(0..N) -> 建 HeaderIndex
+      //  2) 推導 lastUsedDate -> 建 35 天 RangeGate
+      //  3) 只對通過 gate 的檔案做 full read -> 才進 full decode
 
-            // Web 已經把 PRS1 候選檔 bytes 讀入記憶體，但仍要用 header 準濾
-      // 嚴格限制「會進一步解碼」的來源範圍。
-
-      const int _headerMaxBytes = 512;
-      final heads = <String, Uint8List>{};
       final sizeByRel = <String, int>{};
       for (final meta in pickedResult.allFiles) {
         sizeByRel[meta.relativePath] = meta.sizeBytes;
       }
-      for (final e in pickedResult.prs1BytesByRelPath.entries) {
-        final b = e.value;
-        final n = b.length < _headerMaxBytes ? b.length : _headerMaxBytes;
-        heads[e.key] = Uint8List.sublistView(b, 0, n);
-      }
 
       final headerIndex = Prs1HeaderIndex.buildFromHeads(
-        headBytesByRelPath: heads,
+        headBytesByRelPath: pickedResult.prs1HeadBytesByRelPath,
         sizeBytesByRelPath: sizeByRel,
       );
+
       DateTime lastUsed = headerIndex.lastUsedDateLocal ?? DateTime.now();
+      if (headerIndex.lastUsedDateLocal == null) {
+        logW('PRS1 Phase1(Web): lastUsedDate 推導失敗（無可用 header timestamp）；暫以 now 作為 lastUsedDate，並保守允許所有檔案。');
+      }
+
       final gate = Prs1RangeGate(
         allowedStart: lastUsed.subtract(const Duration(days: 35)),
         allowedEnd: lastUsed,
@@ -229,21 +233,37 @@ class _HomePageState extends State<HomePage> {
       }
 
       // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] lastUsedDate=$lastUsed');
       // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] allowedStart=${gate.allowedStart} allowedEnd=${gate.allowedEnd}');
       // ignore: avoid_print
-      final filteredPrs1Bytes = <String, Uint8List>{};
-      for (final e in pickedResult.prs1BytesByRelPath.entries) {
-        if (!allowedRel.contains(e.key)) continue;
-        filteredPrs1Bytes[e.key] = e.value;
+      if (_enablePrs1Logs) print('[PRS1][Phase1][Web] allowedFiles=$allowed skippedFiles=$skipped (unknownTimestamp treated as allowed)');
+
+      // Full-read only for allowed files.
+      if (mounted) {
+        setState(() {
+          _status = 'Phase1 準濾：允許 $allowed / ${headerIndex.entries.length} 檔... 讀取陽壓治療記錄檔案中...';
+        });
       }
+
+      final filteredPrs1Bytes = await WebImport.readFullBytesFor(
+        handle: pickedResult.handle,
+        relativePaths: allowedRel,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(() {
+            _status = '讀取陽壓治療記錄檔案中...（$done / $total）';
+          });
+        },
+      );
 
       if (mounted) {
         setState(() {
           _prs1BlobCount = filteredPrs1Bytes.length;
-          _status =
-              'Phase1 準濾：允許 ${filteredPrs1Bytes.length} / ${pickedResult.prs1BytesByRelPath.length} 檔，開始解析...';
+          _status = 'Phase1 準濾：允許 ${filteredPrs1Bytes.length} 檔，開始解析...';
         });
       }
+
 
       final loader = Prs1Loader();
       final sessions = <Prs1Session>[];
@@ -274,8 +294,10 @@ class _HomePageState extends State<HomePage> {
         final oldestS = mergedSessions.last.start;
         final spanDays = newestS.difference(oldestS).inDays + 1;
         // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1][Web] sessions spanDays=$spanDays (newest=$newestS oldest=$oldestS)');
       } else {
         // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1][Web] sessions=0');
       }
 
       // Web「資訊流控制」：避免一次對整張 SD 進行全量 detail 建索引而卡死。
@@ -319,7 +341,7 @@ class _HomePageState extends State<HomePage> {
       final snapshot = CpapImportSnapshot(
         folderPath: 'web-folder:${pickedResult.displayName}',
         allFiles: allFiles,
-        prs1BytesByRelPath: pickedResult.prs1BytesByRelPath,
+        prs1BytesByRelPath: filteredPrs1Bytes,
       );
 
       final appState = appStateStore;
@@ -349,7 +371,7 @@ class _HomePageState extends State<HomePage> {
 
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('匯入完成：睡眠場次 ${mergedSessions.length}')),
+          SnackBar(content: Text('匯入完成：陽壓治療次數 ${mergedSessions.length}')),
         );
       }
 
@@ -466,10 +488,11 @@ class _HomePageState extends State<HomePage> {
 
       setState(() {
         _fileCount = allFiles.length;
-        _status = '已取得檔案清單（${allFiles.length}）... 讀取 PRS1 檔案 bytes 中...';
+        _status = '已取得檔案清單（${allFiles.length}）... 讀取陽壓治療記錄檔案中...';
       });
 
-            // 1) 先只讀取每個 PRS1 候選檔的前段 header（小於 1KB），建立 HeaderIndex。
+      // ---------------- Phase 1: Header 準濾 + 35 天 RangeGate ----------------
+      // 1) 先只讀取每個 PRS1 候選檔的前段 header（小於 1KB），建立 HeaderIndex。
       // 2) 推導 lastUsedDate。
       // 3) 建立 RangeGate(35 days)，並且「只讀入」允許範圍內的檔案 bytes。
 
@@ -482,7 +505,7 @@ class _HomePageState extends State<HomePage> {
         final pl = f.relativePath.toLowerCase();
         if (!_isPrs1Candidate(pl)) continue;
         sizeByRel[f.relativePath] = f.sizeBytes;
-              // Head-only read
+        // Head-only read (Phase 1)
         final head = await LocalFs.readHead(f.absolutePath, _headerMaxBytes);
         heads[f.relativePath] = head;
       }
@@ -494,6 +517,10 @@ class _HomePageState extends State<HomePage> {
 
       DateTime lastUsed =
           headerIndex.lastUsedDateLocal ?? DateTime.now();
+      if (headerIndex.lastUsedDateLocal == null) {
+        logW('PRS1 Phase1: lastUsedDate 推導失敗（無可用 header timestamp）；暫以 now 作為 lastUsedDate，並保守允許所有檔案。');
+      }
+
       final gate = Prs1RangeGate(
         allowedStart: lastUsed.subtract(const Duration(days: 35)),
         allowedEnd: lastUsed,
@@ -520,8 +547,12 @@ class _HomePageState extends State<HomePage> {
       // - allowed start/end
       // - skipped / allowed counts
       // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] lastUsedDate=$lastUsed');
       // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] allowedStart=${gate.allowedStart} allowedEnd=${gate.allowedEnd}');
       // ignore: avoid_print
+      if (_enablePrs1Logs) print('[PRS1][Phase1] allowedFiles=$allowed skippedFiles=$skipped (unknownTimestamp treated as allowed)');
+
       // 只把「允許範圍內」的 PRS1 檔讀進記憶體（避免整張卡全部吃進來）
       for (final f in allFiles) {
         final pl = f.relativePath.toLowerCase();
@@ -534,7 +565,7 @@ class _HomePageState extends State<HomePage> {
 
       setState(() {
         _prs1BlobCount = prs1Bytes.length;
-        _status = '開始解析（PRS1檔案: ${prs1Bytes.length}）...';
+        _status = '開始解析（陽壓治療檔案: ${prs1Bytes.length}）...';
       });
 
       await _enterComputingPhase(appStateStore);
@@ -558,8 +589,10 @@ class _HomePageState extends State<HomePage> {
         final oldestS = mergedSessions.last.start;
         final spanDays = newestS.difference(oldestS).inDays + 1;
         // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1] sessions spanDays=$spanDays (newest=$newestS oldest=$oldestS)');
       } else {
         // ignore: avoid_print
+        if (_enablePrs1Logs) print('[PRS1][Phase1] sessions=0');
       }
 
       // Web「資訊流控制」：避免一次對整張 SD 進行全量 detail 建索引而卡死。
@@ -696,8 +729,8 @@ class _HomePageState extends State<HomePage> {
                     children: [
                       Text(
                         '01. 請點擊「讀取記憶卡」，將位置指向陽壓呼吸器的記憶卡或是裝置中的指定目錄。\n'
-                        '02. 讀取完整檔案、進入統計引擎皆需要相當的運作時間，敬請您耐心等候。\n'
-                        '03. 本應用程式僅支援 Philips DreamStation 系列陽壓呼吸治療器檔案規格。',
+                        '02. 讀取完整睡眠紀錄檔案、進入統計引擎分析運作皆需要相當的時間，敬請您耐心等候。\n'
+                        '03. 本應用程式僅支援 Philips DreamStation 系列陽壓呼吸治療器檔案格式。',
                         style: theme.textTheme.bodyMedium,
                       ),
                       const SizedBox(height: 14),
@@ -869,7 +902,7 @@ class _HomePageState extends State<HomePage> {
                           children: [
                             Text('狀態：$_status', style: theme.textTheme.bodyMedium),
                             const SizedBox(height: 6),
-                            Text('檔案：$_fileCount、PRS1檔案：$_prs1BlobCount、睡眠場次：${appState.prs1Sessions.length}',
+                            Text('檔案：$_fileCount、呼吸治療檔案：$_prs1BlobCount、陽壓治療次數：${appState.prs1Sessions.length}',
                                 style: theme.textTheme.bodySmall),
                             if (snap != null) ...[
                               const SizedBox(height: 6),

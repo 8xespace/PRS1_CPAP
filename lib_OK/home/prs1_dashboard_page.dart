@@ -36,7 +36,7 @@ Color _readableOn(Color bg) {
   return bg.computeLuminance() > 0.55 ? Colors.black : Colors.white;
 }
 
-/// 右側圖表序列載入的 key（順序固定）。
+/// Phase 4：右側圖表序列載入的 key（順序固定）。
 enum _ChartKey {
   events,
   flowRate,
@@ -119,7 +119,7 @@ class _AhiBanner extends StatelessWidget {
 
     if (onTap == null) return content;
 
-    // AHI 變按鈕（點擊後展開右側區域）。
+    // Phase 3：AHI 變按鈕（點擊後展開右側區域）。
     return Material(
       color: Colors.transparent,
       child: InkWell(
@@ -139,10 +139,11 @@ class Prs1DashboardPage extends StatefulWidget {
 }
 
 class _Prs1DashboardPageState extends State<Prs1DashboardPage> {
+  static const bool kPrs1UiLogs = false; // set true to re-enable Phase4/5 debugPrint logs
   late ScrollController _rightChartsCtrl;
   Key _rightChartsListKey = UniqueKey();
 
-  // 右側圖表序列載入（按 AHI 後才開始），並支援 cancel。
+  // Phase 4：右側圖表序列載入（按 AHI 後才開始），並支援 cancel。
   bool _showRight = false;
   final List<_ChartKey> _loadedCharts = <_ChartKey>[];
   int _queueToken = 0;
@@ -190,9 +191,11 @@ ColorScheme get scheme => Theme.of(context).colorScheme;
 
   
   void _hardClearWorkingSet(String reason) {
-    // 記憶體釋放保證（偏硬控制）：
+    // Phase 5：記憶體釋放保證（偏硬控制）：
     // - 右側只保留「目前選日」，一換日就全部丟掉重算。
     // - 取消載入隊列、清空右側 charts、重建 ScrollController 以釋放 ScrollPosition/clients。
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase5] clear working set: $reason');
+
     // cancel queue + clear right
     _queueToken++;
     _queueDay = null;
@@ -207,6 +210,7 @@ ColorScheme get scheme => Theme.of(context).colorScheme;
       try {
         old.dispose();
       } catch (_) {}
+      if (kPrs1UiLogs) debugPrint('[PRS1][Phase5] controllers disposed/recreated; right cleared.');
     });
   }
 
@@ -236,13 +240,18 @@ void _cancelRight({required bool resetShowRight}) {
     _loadedCharts.clear();
     _rightChartsListKey = UniqueKey();
     _showRight = true;
+
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] start ChartLoadQueue day=$day');
+
     // 逐張載入：每張完成就更新 UI。
     for (final k in _ChartKey.values) {
       if (!mounted) return;
       if (myToken != _queueToken) {
+        if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue cancelled (token changed)');
         return;
       }
       if (_queueDay != day) {
+        if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue cancelled (day changed)');
         return;
       }
 
@@ -253,6 +262,8 @@ void _cancelRight({required bool resetShowRight}) {
       // 小間隔讓使用者看起來像「逐張出現」，同時避免一次性建構造成尖峰。
       await Future.delayed(const Duration(milliseconds: 70));
     }
+
+    if (kPrs1UiLogs) debugPrint('[PRS1][Phase4] queue finished ($day)');
   }
 
   String _chartTitle(_ChartKey k) {
@@ -514,7 +525,7 @@ final snoreStats = _statsOfValues(snoreSeries);
             // 統計區（左欄）不要再縮小：避免 iPad/桌面下可讀性崩壞。
             const double minLeftWidth = 430;
 
-            // 右側圖表序列載入（按 AHI 後才開始），並逐張出現。
+            // Phase 4：右側圖表序列載入（按 AHI 後才開始），並逐張出現。
             // 重要：在 _showRight=false 時，右側 widget 完全不建立。
             Widget _rightPanel() {
               final cs = Theme.of(context).colorScheme;
@@ -616,7 +627,7 @@ final snoreStats = _statsOfValues(snoreSeries);
                       ahi: nightlyAhi,
                       onTap: () {
                         if (!isWide) return;
-                        // 開始序列載入右側圖表（按指定順序逐張出現）。
+                        // Phase 4：開始序列載入右側圖表（按指定順序逐張出現）。
                         if (_showRight && _queueDay == b.day) return;
                         setState(() {
                           // 先把右側開起來，並清空舊狀態。
@@ -642,7 +653,7 @@ final snoreStats = _statsOfValues(snoreSeries);
             );
 
             if (isWide) {
-              // 起始只 render 左側；按下 AHI 後，左側以「迅速」動畫縮到固定寬度，右側逐張載入。
+              // Phase 4：起始只 render 左側；按下 AHI 後，左側以「迅速」動畫縮到固定寬度，右側逐張載入。
               if (!_showRight) return leftPanel;
 
               final totalW = constraints.maxWidth;
@@ -728,31 +739,6 @@ class _LowCostChartTileState extends State<_LowCostChartTile> {
     final cs = Theme.of(context).colorScheme;
     final bg = cs.surfaceContainerHighest.withOpacity(0.20);
 
-    Widget header() {
-      return Row(
-        children: [
-          Container(
-            width: 9,
-            height: 9,
-            decoration: BoxDecoration(
-              color: cs.primary.withOpacity(0.85),
-              borderRadius: BorderRadius.circular(99),
-            ),
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              widget.title,
-              style: TextStyle(
-                fontSize: 15,
-                fontWeight: FontWeight.w900,
-                color: cs.onSurface.withOpacity(0.92),
-              ),
-            ),
-          ),
-        ],
-      );
-    }
 
     Widget skeleton() {
       return Container(
@@ -807,8 +793,8 @@ class _LowCostChartTileState extends State<_LowCostChartTile> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          header(),
-          const SizedBox(height: 10),
+          // NOTE: Per UI spec, remove the auto-generated small section header on each right-side tile.
+          // Each chart widget already renders its own title internally.
           body,
         ],
       ),

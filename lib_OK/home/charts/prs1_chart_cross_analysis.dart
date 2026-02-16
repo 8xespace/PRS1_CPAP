@@ -159,14 +159,24 @@ class _Prs1ChartCrossAnalysisState extends State<Prs1ChartCrossAnalysis> {
         const SizedBox(height: 8),
         LayoutBuilder(
           builder: (context, constraints) {
-            final w = constraints.maxWidth;
+            final maxW = constraints.maxWidth.isFinite ? constraints.maxWidth : 900.0;
             final plotH = 140.0;
 
-            // Keep same "feel" as other charts: about 1.5~2.0 px per minute.
-            // We clamp at min/max for safety.
-            final pxPerMinute = (w / (24 * 60)).clamp(1.2, 2.2);
+            // IMPORTANT (iOS/iPad 對齊修正):
+            // 其他圖表（氣流/壓力/漏氣…）的時間軸縮放，是以「可視窗 20:30→09:00 共 750 分鐘」
+            // 的 viewport 寬度來推導 pxPerMinute，再用 Scroll/拖曳去看隱藏的時間段。
+            // 交叉分析圖若用 `w/1440`（還把左側 labelW 算進去），在寬螢幕（iPad）會和其他圖
+            // 表的整點格線產生不同的「小數縮放」，造成整點垂直線相對位移。
+            //
+            // 做法：跟其他圖表一致，先扣掉左側 labelW，使用 750 分鐘視窗推導 pxPerMinute，
+            // 再把完整 24h（1440 分鐘）當成 content 寬度，允許水平拖曳瀏覽。
+            const labelW = 96.0;
+            const rightPad = 6.0;
+            final chartViewportW = math.max(0.0, maxW - labelW - rightPad);
 
-            return Container(
+            final pxPerMinute = (chartViewportW / 750.0) * 0.95;
+            final contentW = (24 * 60) * pxPerMinute;
+return Container(
               height: plotH + 34,
               decoration: BoxDecoration(
                 color: scheme.surface,
@@ -181,7 +191,7 @@ class _Prs1ChartCrossAnalysisState extends State<Prs1ChartCrossAnalysis> {
                       _panX += d.delta.dx;
                       // Clamp pan so user can't scroll too far beyond 0..24h.
                       final maxPan = 0.0;
-                      final minPan = -(24 * 60) * pxPerMinute;
+                      final minPan = -(contentW - chartViewportW);
                       _panX = _panX.clamp(minPan, maxPan);
                     });
                   },
