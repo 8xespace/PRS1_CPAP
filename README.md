@@ -113,6 +113,15 @@ GitHub: https://github.com/8xespace/PRS1_CPAP
   iPad        完整專業分析模式
   Web Debug   開發測試環境
 
+❤️ 致謝
+
+OSCAR 開源社群:
+https://gitlab.com/CrimsonNape/OSCAR-code
+睡眠治療使用者
+iPad 重度使用測試
+
+------------------------------------------------------------------------
+
 # 💤 SleepToBao PRS1
 
 ### Philips DreamStation Sleep Therapy Data Analyzer
